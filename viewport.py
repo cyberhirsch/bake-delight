@@ -103,8 +103,70 @@ class OBJMesh:
         return position_index, uv_index
 
 
+_MESH_CACHE = {}
+
+
+def load_obj(path):
+    """Parse an OBJ once per file version; viewports share the result (safe to call from a worker thread)."""
+    key = (os.path.abspath(path), os.path.getmtime(path))
+    mesh = _MESH_CACHE.get(key)
+    if mesh is None:
+        mesh = OBJMesh(path)
+        while len(_MESH_CACHE) >= 4:
+            _MESH_CACHE.pop(next(iter(_MESH_CACHE)))
+        _MESH_CACHE[key] = mesh
+    return mesh
+
+
+class Camera:
+    """Orbit camera plus display options that several viewports share, so their views stay linked."""
+
+    def __init__(self):
+        self.views = []
+        self.fov = 50.0
+        self.wireframe = False
+        self.wire_color = (0.92, 0.92, 0.92, 0.45)
+        self.checker = False         # procedural UV checker instead of the texture
+        self.checker_cells = 32
+        self.texture_filter = "mipmap"  # "mipmap", "linear" or "nearest"
+        self.background = (0.04, 0.04, 0.04)
+        self.orbit_speed = 0.5       # degrees per pixel dragged
+        self.zoom_step = 1.14
+        self.reset()
+
+    def reset(self):
+        self.yaw, self.pitch, self.distance = 25.0, 15.0, 3.0
+
+    def changed(self):
+        for view in self.views:
+            view.redraw()
+
+
+class _Slot:
+    """One mesh + texture pair. Paths are what the GUI asked for; the GL objects belong to one context."""
+
+    def __init__(self):
+        self.mesh = None
+        self.image = None          # (width, height, RGBA bytes) awaiting upload
+        self.texture_path = None
+        self.vertex_buffer = None
+        self.uploaded_mesh = None
+        self.texture_id = None
+        self.uploaded_texture = None
+        self.has_mipmaps = False
+
+    @property
+    def triangles(self):
+        return self.mesh.vertex_count // 3 if self.mesh is not None else 0
+
+
 class TextureViewport(OpenGLFrame):
-    """Unlit, UV-textured OBJ viewport with orbit and zoom controls."""
+    """Unlit, UV-textured OBJ viewport with orbit and zoom controls.
+
+    It holds two slots, "a" (before) and "b" (after), and shows one of them or
+    both split by a draggable wipe line ("wipe"). Viewports constructed with
+    the same Camera orbit and zoom together.
+    """
 
     VERTEX_SHADER = """
         #version 120
@@ -117,135 +179,212 @@ class TextureViewport(OpenGLFrame):
     FRAGMENT_SHADER = """
         #version 120
         uniform sampler2D texture_map;
+        uniform int mode;            // 0 texture, 1 flat colour (wireframe), 2 UV checker
+        uniform vec4 flat_color;
+        uniform float cells;
         varying vec2 uv;
-        void main() { gl_FragColor = texture2D(texture_map, uv); }
+        void main() {
+            if (mode == 1) { gl_FragColor = flat_color; return; }
+            if (mode == 2) {
+                float c = mod(floor(uv.x * cells) + floor(uv.y * cells), 2.0);
+                gl_FragColor = vec4(mix(vec3(0.16), vec3(0.82), c), 1.0);
+                return;
+            }
+            gl_FragColor = texture2D(texture_map, uv);
+        }
     """
 
-    def __init__(self, master, **kwargs):
+    def __init__(self, master, camera=None, **kwargs):
         if GL is None:
             raise RuntimeError("OpenGL preview dependencies are not installed.")
         super().__init__(master, **kwargs)
-        self.mesh = None
-        self.mesh_path = None
-        self.texture_id = None
         self.program = None
-        self.vertex_buffer = None
-        self.yaw = 25.0
-        self.pitch = 15.0
-        self.distance = 3.0
-        self.fov = 50.0
+        self.camera = camera or Camera()
+        self.camera.views.append(self)
+        self.slots = {"a": _Slot(), "b": _Slot()}
+        self.mode = "b"            # "a", "b" or "wipe"
+        self.split = 0.5           # wipe position, fraction of the width from the left
         self._drag_start = None
+        self._dragging_split = False
         self.bind("<ButtonPress-1>", self._begin_drag)
         self.bind("<B1-Motion>", self._drag)
         self.bind("<ButtonRelease-1>", self._end_drag)
+        self.bind("<Motion>", self._hover)
         self.bind("<MouseWheel>", self._wheel)
         self.bind("<Button-4>", lambda event: self._zoom(-1))
         self.bind("<Button-5>", lambda event: self._zoom(1))
 
     def initgl(self):
-        GL.glClearColor(0.035, 0.047, 0.065, 1.0)
+        GL.glClearColor(0.04, 0.04, 0.04, 1.0)
         GL.glEnable(GL.GL_DEPTH_TEST)
         self.program = shaders.compileProgram(
             shaders.compileShader(self.VERTEX_SHADER, GL.GL_VERTEX_SHADER),
             shaders.compileShader(self.FRAGMENT_SHADER, GL.GL_FRAGMENT_SHADER),
         )
 
-    def load_mesh(self, path):
-        normalized_path = os.path.abspath(path)
-        if self.mesh is not None and self.mesh_path == normalized_path and self.vertex_buffer is not None:
-            # Preview texture changes should not reparse the OBJ or reset the
-            # camera. The mesh is independent from the texture bound below.
-            return
-
-        self.mesh = OBJMesh(path)
-        self.vertex_buffer = GL.glGenBuffers(1)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.vertex_buffer)
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, self.mesh.vertex_data.nbytes, self.mesh.vertex_data, GL.GL_STATIC_DRAW)
-        self.mesh_path = normalized_path
-        self.reset_view()
+    def tkResize(self, event):
+        # The base class re-runs initgl on every resize, in whatever context is
+        # current; with several viewports that compiles into the wrong one.
+        self.width, self.height = event.width, event.height
         self.redraw()
 
-    def load_texture(self, path):
-        if not path or not os.path.isfile(path):
-            self._delete_texture()
-            return
-        with Image.open(path) as source:
-            image = source.convert("RGBA").transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-            width, height = image.size
-            pixels = image.tobytes()
-        if self.texture_id is None:
-            self.texture_id = GL.glGenTextures(1)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self.texture_id)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_REPEAT)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_REPEAT)
-        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA, width, height, 0, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, pixels)
+    def _display(self):
         self.redraw()
 
-    def _delete_texture(self):
-        if self.texture_id is not None:
-            GL.glDeleteTextures([self.texture_id])
-            self.texture_id = None
+    # ------------------------------------------------------------ content
+
+    def set_slot(self, slot, mesh_path=None, texture_path=None):
+        """Show `mesh_path` with `texture_path` in slot "a" or "b". Parsing and decoding happen
+        here, so errors reach the caller; the GL upload waits until the context exists."""
+        target = self.slots[slot]
+        target.mesh = load_obj(mesh_path) if mesh_path and os.path.isfile(mesh_path) else None
+        if texture_path and os.path.isfile(texture_path):
+            stamp = (texture_path, os.path.getmtime(texture_path))
+            if stamp != target.texture_path:
+                with Image.open(texture_path) as source:
+                    image = source.convert("RGBA").transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+                    target.image = (image.width, image.height, image.tobytes())
+                target.texture_path = stamp
+        else:
+            target.image, target.texture_path = None, None
         self.redraw()
+
+    def set_mode(self, mode):
+        self.mode = mode
+        self.configure(cursor="")
+        self.redraw()
+
+    def _sync(self, slot):
+        """Upload whatever changed since the last draw, in this viewport's context."""
+        if slot.mesh is not slot.uploaded_mesh:
+            if slot.mesh is not None:
+                if slot.vertex_buffer is None:
+                    slot.vertex_buffer = GL.glGenBuffers(1)
+                GL.glBindBuffer(GL.GL_ARRAY_BUFFER, slot.vertex_buffer)
+                GL.glBufferData(GL.GL_ARRAY_BUFFER, slot.mesh.vertex_data.nbytes, slot.mesh.vertex_data, GL.GL_STATIC_DRAW)
+            slot.uploaded_mesh = slot.mesh
+        if slot.image is not None:
+            width, height, pixels = slot.image
+            if slot.texture_id is None:
+                slot.texture_id = GL.glGenTextures(1)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, slot.texture_id)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_REPEAT)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_REPEAT)
+            GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA, width, height, 0, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, pixels)
+            try:
+                GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
+                slot.has_mipmaps = True
+            except Exception:  # pre-GL3 driver: no mipmaps, linear filtering only
+                slot.has_mipmaps = False
+            slot.uploaded_texture, slot.image = slot.texture_path, None
+        elif slot.texture_path is None:
+            slot.uploaded_texture = None
+
+    # ------------------------------------------------------------ camera
 
     def reset_view(self):
-        self.yaw, self.pitch, self.distance = 25.0, 15.0, 3.0
-        self.redraw()
+        self.camera.reset()
+        self.camera.changed()
 
     def set_fov(self, fov):
-        self.fov = max(20.0, min(120.0, float(fov)))
-        self.redraw()
+        self.camera.fov = max(20.0, min(120.0, float(fov)))
+        self.camera.changed()
+
+    def _near_split(self, x):
+        return self.mode == "wipe" and abs(x - self.split * max(1, self.winfo_width())) <= 6
+
+    def _hover(self, event):
+        self.configure(cursor="sb_h_double_arrow" if self._near_split(event.x) else "")
 
     def _begin_drag(self, event):
-        self._drag_start = (event.x, event.y, self.yaw, self.pitch)
+        self._dragging_split = self._near_split(event.x)
+        self._drag_start = (event.x, event.y, self.camera.yaw, self.camera.pitch)
 
     def _drag(self, event):
-        if self._drag_start:
-            x, y, yaw, pitch = self._drag_start
-            self.yaw = yaw - (event.x - x) * 0.5
-            self.pitch = max(-89.0, min(89.0, pitch + (event.y - y) * 0.5))
+        if self._dragging_split:
+            self.split = max(0.0, min(1.0, event.x / max(1, self.winfo_width())))
             self.redraw()
+        elif self._drag_start:
+            x, y, yaw, pitch = self._drag_start
+            speed = self.camera.orbit_speed
+            self.camera.yaw = yaw - (event.x - x) * speed
+            self.camera.pitch = max(-89.0, min(89.0, pitch + (event.y - y) * speed))
+            self.camera.changed()
 
     def _end_drag(self, _event):
         self._drag_start = None
+        self._dragging_split = False
 
     def _wheel(self, event):
         self._zoom(-1 if event.delta > 0 else 1)
 
     def _zoom(self, direction):
-        self.distance = max(1.2, min(12.0, self.distance * (0.88 if direction < 0 else 1.14)))
-        self.redraw()
+        camera = self.camera
+        camera.distance = max(1.2, min(12.0, camera.distance * (1.0 / camera.zoom_step if direction < 0 else camera.zoom_step)))
+        camera.changed()
+
+    # ------------------------------------------------------------ drawing
 
     def redraw(self):
-        if not self.winfo_exists() or not self.program:
+        if not self.winfo_exists() or not self.program or not self.winfo_ismapped():
             return
+        self.tkMakeCurrent()  # several viewports means several GL contexts
         width = max(1, self.winfo_width())
         height = max(1, self.winfo_height())
         GL.glViewport(0, 0, width, height)
+        GL.glDisable(GL.GL_SCISSOR_TEST)
+        GL.glClearColor(*self.camera.background, 1.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
-        if self.mesh is None or self.texture_id is None:
-            self.tkSwapBuffers()
-            return
+        for slot in self.slots.values():
+            self._sync(slot)
 
-        aspect = width / height
-        projection = self._perspective(math.radians(self.fov), aspect, 0.1, 100.0)
-        yaw = math.radians(self.yaw)
-        pitch = math.radians(self.pitch)
+        camera = self.camera
+        projection = self._perspective(math.radians(camera.fov), width / height, 0.1, 100.0)
+        yaw, pitch = math.radians(camera.yaw), math.radians(camera.pitch)
         eye = np.array([
-            self.distance * math.cos(pitch) * math.sin(yaw),
-            self.distance * math.sin(pitch),
-            self.distance * math.cos(pitch) * math.cos(yaw),
+            camera.distance * math.cos(pitch) * math.sin(yaw),
+            camera.distance * math.sin(pitch),
+            camera.distance * math.cos(pitch) * math.cos(yaw),
         ], dtype=np.float32)
         view = self._look_at(eye, np.zeros(3, dtype=np.float32), np.array([0, 1, 0], dtype=np.float32))
         transform = projection @ view
 
-        GL.glUseProgram(self.program)
-        GL.glUniformMatrix4fv(GL.glGetUniformLocation(self.program, "transform"), 1, GL.GL_TRUE, transform)
-        GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self.texture_id)
-        GL.glUniform1i(GL.glGetUniformLocation(self.program, "texture_map"), 0)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self.vertex_buffer)
+        if self.mode == "wipe":
+            split = int(round(self.split * width))
+            GL.glEnable(GL.GL_SCISSOR_TEST)
+            GL.glScissor(0, 0, split, height)
+            self._draw(self.slots["a"], transform)
+            GL.glScissor(split, 0, width - split, height)
+            self._draw(self.slots["b"], transform)
+            GL.glScissor(max(0, split - 1), 0, 2, height)
+            GL.glClearColor(0.88, 0.88, 0.88, 1.0)
+            GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+            GL.glDisable(GL.GL_SCISSOR_TEST)
+        else:
+            self._draw(self.slots[self.mode], transform)
+        self.tkSwapBuffers()
+
+    def _draw(self, slot, transform):
+        camera = self.camera
+        if slot.uploaded_mesh is None or (slot.uploaded_texture is None and not camera.checker):
+            return
+        program = self.program
+        GL.glUseProgram(program)
+        GL.glUniformMatrix4fv(GL.glGetUniformLocation(program, "transform"), 1, GL.GL_TRUE, transform)
+        GL.glUniform1i(GL.glGetUniformLocation(program, "mode"), 2 if camera.checker else 0)
+        GL.glUniform1f(GL.glGetUniformLocation(program, "cells"), float(camera.checker_cells))
+        if slot.uploaded_texture is not None:
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, slot.texture_id)
+            nearest = camera.texture_filter == "nearest"
+            mipmap = camera.texture_filter == "mipmap" and slot.has_mipmaps
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST if nearest else GL.GL_LINEAR)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER,
+                               GL.GL_NEAREST if nearest else GL.GL_LINEAR_MIPMAP_LINEAR if mipmap else GL.GL_LINEAR)
+            GL.glUniform1i(GL.glGetUniformLocation(program, "texture_map"), 0)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, slot.vertex_buffer)
         stride = 5 * 4
         position = GL.glGetAttribLocation(self.program, "position")
         texcoord = GL.glGetAttribLocation(self.program, "texcoord")
@@ -253,11 +392,22 @@ class TextureViewport(OpenGLFrame):
         GL.glVertexAttribPointer(position, 3, GL.GL_FLOAT, GL.GL_FALSE, stride, None)
         GL.glEnableVertexAttribArray(texcoord)
         GL.glVertexAttribPointer(texcoord, 2, GL.GL_FLOAT, GL.GL_FALSE, stride, ctypes.c_void_p(12))
-        GL.glDrawArrays(GL.GL_TRIANGLES, 0, self.mesh.vertex_count)
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, slot.uploaded_mesh.vertex_count)
+        if camera.wireframe:
+            # Second pass over the same triangles; OBJ polygons are fan-triangulated, so quads show a diagonal.
+            GL.glUniform1i(GL.glGetUniformLocation(program, "mode"), 1)
+            GL.glUniform4f(GL.glGetUniformLocation(program, "flat_color"), *camera.wire_color)
+            GL.glEnable(GL.GL_BLEND)
+            GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+            GL.glDepthFunc(GL.GL_LEQUAL)
+            GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_LINE)
+            GL.glDrawArrays(GL.GL_TRIANGLES, 0, slot.uploaded_mesh.vertex_count)
+            GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_FILL)
+            GL.glDepthFunc(GL.GL_LESS)
+            GL.glDisable(GL.GL_BLEND)
         GL.glDisableVertexAttribArray(position)
         GL.glDisableVertexAttribArray(texcoord)
         GL.glUseProgram(0)
-        self.tkSwapBuffers()
 
     @staticmethod
     def _perspective(fov, aspect, near, far):

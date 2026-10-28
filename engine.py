@@ -247,7 +247,13 @@ class DelighterInferenceEngine:
         output_save_path: str,
         log_callback=None,
         tiled_mode: bool = False,
+        tile_size: int = 0,
+        tile_overlap: float = 0.25,
+        bit_depth: int = 8,
+        apply_mask: bool = True,
     ):
+        """tile_size 0 = half the image; tile_overlap is a fraction of the tile;
+        bit_depth 8 or 16 for the PNG written; apply_mask blacks out texels outside the UVs."""
         def log(msg):
             print(f"[Inference] {msg}")
             if log_callback:
@@ -292,11 +298,11 @@ class DelighterInferenceEngine:
 
         # 3. Dynamic Tiling Execution Strategy
         # Determine tile size: 1/2 of image size, or direct execution if < 2048
-        is_tiling_eligible = (h >= 2048) and tiled_mode
+        tile_size = min(tile_size or h // 2, h)
+        is_tiling_eligible = (h >= 2048) and tiled_mode and tile_size < h
 
         if is_tiling_eligible:
-            tile_size = h // 2
-            overlap = tile_size // 4
+            overlap = max(1, int(tile_size * min(max(tile_overlap, 0.05), 0.5)))
             stride = tile_size - overlap
 
             # 2D cosine window for edge blending
@@ -315,7 +321,7 @@ class DelighterInferenceEngine:
                 x_steps.append(w - tile_size)
 
             total_tiles = len(y_steps) * len(x_steps)
-            log(f"Processing in tiled mode (half-size tiles): {total_tiles} x {tile_size}x{tile_size} tiles...")
+            log(f"Processing in tiled mode: {total_tiles} x {tile_size}x{tile_size} tiles, {overlap} px overlap...")
 
             accumulator = np.zeros((3, h, w), dtype=np.float32)
             weight_map = np.zeros((1, h, w), dtype=np.float32)
@@ -373,13 +379,17 @@ class DelighterInferenceEngine:
         # 4. Convert Linear -> sRGB & Apply UV Mask
         log("Converting predicted Albedo to sRGB space...")
         pred_srgb = linear_to_srgb(pred_albedo_linear)
-        pred_srgb = pred_srgb * mask_t
+        if apply_mask:
+            pred_srgb = pred_srgb * mask_t
 
         # 5. Save output map to disk
-        log("Saving final 8-bit image to disk...")
+        log(f"Saving final {bit_depth}-bit image to disk...")
         pred_np = np.transpose(pred_srgb, (1, 2, 0))
-        pred_8bit = (np.clip(pred_np, 0.0, 1.0) * 255.0).astype(np.uint8)
-        output_bgr = cv2.cvtColor(pred_8bit, cv2.COLOR_RGB2BGR)
+        if bit_depth == 16:
+            pred_int = (np.clip(pred_np, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
+        else:
+            pred_int = (np.clip(pred_np, 0.0, 1.0) * 255.0).astype(np.uint8)
+        output_bgr = cv2.cvtColor(pred_int, cv2.COLOR_RGB2BGR)
 
         output_path = Path(output_save_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
