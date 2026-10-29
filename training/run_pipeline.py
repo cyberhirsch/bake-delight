@@ -46,6 +46,14 @@ def stage(name: str, command: list[str], log_dir: Path) -> None:
         raise SystemExit(f"{name} failed with exit code {code}; see {log_path}")
 
 
+def train_options(args) -> list[str]:
+    options = []
+    for flag, value in (("--batch", args.batch), ("--crop", args.crop), ("--lr", args.lr), ("--eval-every", args.eval_every)):
+        if value is not None:
+            options += [flag, str(value)]
+    return options
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--profile", choices=PROFILES, required=True)
@@ -54,6 +62,11 @@ def main() -> int:
     parser.add_argument("--variations", type=int, help="override lightings per asset")
     parser.add_argument("--tag", default="", help="suffix for output folders (testing)")
     parser.add_argument("--stop-after", choices=["bake", "postprocess", "train"], default="train")
+    # passed through to train.py when given (the trainer UI sets these)
+    parser.add_argument("--batch", type=int)
+    parser.add_argument("--crop", type=int)
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--eval-every", type=int)
     args = parser.parse_args()
 
     profile = PROFILES[args.profile]
@@ -79,7 +92,7 @@ def main() -> int:
             print(f"dataset ready: {dataset}", flush=True)
             return 0
         stage("3_train", [PYTHON, "train.py", "--data", str(dataset), "--run", str(run),
-                          "--steps", str(args.steps or profile["steps"]), "--resume"], logs)
+                          "--steps", str(args.steps or profile["steps"]), "--resume", *train_options(args)], logs)
     finally:
         keep_awake(False)
     print(f"done: model at {run / 'delighter.onnx'}", flush=True)
