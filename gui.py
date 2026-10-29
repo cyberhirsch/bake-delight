@@ -9,12 +9,14 @@ import webbrowser
 import cv2
 import customtkinter as ctk
 import tkinter as tk
-import tkinter.font as tkfont
 from tkinter import filedialog, messagebox
 from tkinterdnd2 import TkinterDnD, DND_FILES
 from PIL import Image
 
+from bakedelight.project import SUFFIX as PROJECT_SUFFIX, Project, ProjectError
 from engine import DelighterInferenceEngine
+from tui import (ACCENT, ACCENT_DIM, BG, BORDER, BORDER_HI, DIM, ERROR, FIELD, HINT, PANEL, TEXT, TEXT_HI,  # noqa: F401
+                 WARN, TuiWidgets)
 try:
     from viewport import OPENGL_AVAILABLE, Camera, TextureViewport, load_obj
 except Exception:
@@ -39,21 +41,6 @@ MAX_BEFORE_SCAN_BYTES = 400 * 1024 * 1024
 BACKGROUNDS = {"Void": (0.0, 0.0, 0.0), "Charcoal": (0.04, 0.04, 0.04), "Graphite": (0.16, 0.16, 0.16),
                "Mid grey": (0.42, 0.42, 0.42), "Paper": (0.86, 0.86, 0.86)}
 
-# TUI palette: greyscale only. State is shown by brightness and by markers (●, !!), never by hue.
-BG = "#000000"
-PANEL = "#060606"
-FIELD = "#0d0d0d"
-BORDER = "#262626"
-BORDER_HI = "#555555"
-HINT = "#4a4a4a"
-TEXT = "#c8c8c8"
-TEXT_HI = "#ffffff"
-DIM = "#6e6e6e"
-ACCENT = "#ffffff"       # primary buttons, section rules, active marks
-ACCENT_DIM = "#2e2e2e"   # selected segment, slider fill
-WARN = "#9a9a9a"
-ERROR = "#ffffff"        # errors read by their "!!" / FAILED text, in full white
-
 # Every persisted setting: key -> default. The type of the default picks the Tk variable.
 DEFAULTS = {
     # input
@@ -63,7 +50,7 @@ DEFAULTS = {
     "bit_depth": "8", "apply_mask": True, "output_name": "delighted_albedo.png", "show_after_run": True,
     # scan optimiser
     "scan": "", "photo": "", "scan_out": "", "remesher": next(iter(REMESHERS)), "faces": "10000",
-    "resolution": "2048", "unwrap": "xatlas", "smart_angle": 66.0, "margin": "16", "ao_samples": "64",
+    "resolution": "2048", "backend": "auto", "unwrap": "xatlas", "smart_angle": 66.0, "margin": "16", "ao_samples": "64",
     "cage": 0.01, "max_ray": 0.03, "roughness": 0.8, "roughness_variation": 0.25,
     "sharp": False, "scan_tiled": False, "keep_work": False,
     # view
@@ -76,7 +63,19 @@ DEFAULTS = {
     "xatlas_site": r"F:\DelighterData\tools\blender-site", "scanopt_python": "", "ui_scale": 1.0, "log_lines": "2000",
 }
 
+# GUI setting -> project setting. These go into .bad files; the rest is per machine (settings.json).
+PROJECT_KEYS = {
+    **{key: f"delight.{key}" for key in ("model", "lit", "normal", "ao", "mask", "output_dir", "output_name", "onnx_model",
+                                         "force_cpu", "tiled", "tile_size", "tile_overlap", "bit_depth", "apply_mask")},
+    **{key: f"scan.{key}" for key in ("scan", "photo", "remesher", "faces", "resolution", "backend", "unwrap", "smart_angle",
+                                      "margin", "ao_samples", "cage", "max_ray", "roughness", "roughness_variation",
+                                      "sharp", "keep_work")},
+    "scan_out": "scan.out", "scan_tiled": "scan.tiled",
+}
+PROJECT_FILETYPES = [("Bake & Delight project", f"*{PROJECT_SUFFIX}")]
+
 KEYMAP = [
+    ("Ctrl+N / O / S", "new / open / save project"), ("Ctrl+Shift+S", "save project as"),
     ("F5", "run de-light"), ("F6", "run scan optimiser"), ("1 / 2 / 3", "single / side by side / wipe"),
     ("Space", "single view: before <-> after"), ("W", "wireframe"), ("C", "UV checker"),
     ("R", "reset camera"), ("A", "auto-rotate"), ("Ctrl+L", "clear log"),
@@ -89,7 +88,7 @@ class CTkApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self.TkdndVersion = TkinterDnD._require(self)
 
 
-class DelighterGUI:
+class DelighterGUI(TuiWidgets):
     def __init__(self):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -122,6 +121,8 @@ class DelighterGUI:
         self.viewport_before = None    # left view in side-by-side mode, same camera
         self.viewport_error = None
         self._scan_before = None       # (original scan OBJ, photo) once an optimised scan is shown
+        self.project = None            # the open .bad project, if any
+        self._project_saved = None     # its settings and results as last saved, to detect changes
         self._save_job = None
         self._rotate_last = None
         # Worker threads must not call Tk ("main thread is not in main loop"); they post here instead.
@@ -162,26 +163,6 @@ class DelighterGUI:
 
     # ================================================================ logo
 
-    @staticmethod
-    def _logo_image(size=64):
-        """The mark: a half-lit disc, the lit side white and the shadow side outlined only."""
-        from PIL import ImageDraw
-        scale = 4  # draw large, downsample for clean edges
-        canvas = size * scale
-        image = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 255))
-        draw = ImageDraw.Draw(image)
-        inset, stroke = canvas * 0.14, max(2, canvas // 22)
-        box = (inset, inset, canvas - inset, canvas - inset)
-        draw.ellipse(box, outline=(255, 255, 255, 255), width=stroke)
-        draw.pieslice(box, 90, 270, fill=(255, 255, 255, 255))
-        return image.resize((size, size), Image.Resampling.LANCZOS)
-
-    def _set_icon(self):
-        from PIL import ImageTk
-        self._icon = ImageTk.PhotoImage(self._logo_image(64), master=self.root)
-        # CustomTkinter installs its own icon shortly after start; set ours after it.
-        self.root.after(300, lambda: self.root.iconphoto(True, self._icon))
-
     # ================================================================ settings
 
     @staticmethod
@@ -220,8 +201,130 @@ class DelighterGUI:
         self._append_log("settings reset to defaults")
 
     def _on_close(self):
+        if not self._confirm_discard():
+            return
         self._save_settings()
         self.root.destroy()
+
+    # ================================================================ projects (.bad)
+
+    def _project_values(self):
+        """The current GUI settings as project settings (section.key -> value)."""
+        values = {}
+        for key, dotted in PROJECT_KEYS.items():
+            value = self._value(key)
+            if key == "remesher":
+                value = REMESHERS.get(value, "decimate")
+            elif key == "tile_size" and value == "auto":
+                value = 0
+            values[dotted] = value
+        return values
+
+    def _project_state(self):
+        try:
+            return json.dumps([self._project_values(), self.project.results if self.project else {}], sort_keys=True, default=str)
+        except tk.TclError:
+            return None
+
+    def _confirm_discard(self):
+        """True when it is fine to drop the open project: unchanged, saved now, or the user says so."""
+        if self.project is None or self._project_state() == self._project_saved:
+            return True
+        answer = messagebox.askyesnocancel("Project", f"Save changes to {self.project.path.name}?", parent=self.root)
+        if answer is None:
+            return False
+        return self._save_project() if answer else True
+
+    def _new_project(self):
+        if not self._confirm_discard():
+            return
+        for key, dotted in PROJECT_KEYS.items():
+            self.var[key].set(DEFAULTS[key])
+        self.project, self._project_saved = None, None
+        self.last_output_path, self._scan_before = None, None
+        self.albedo_radio.configure(state="disabled")
+        self.preview_texture.set("lit")
+        self._show_project_name()
+        self._append_log("project: new (unsaved)")
+        self._refresh_viewport()
+
+    def _open_project(self, path=None):
+        if not self._confirm_discard():
+            return
+        path = path or filedialog.askopenfilename(parent=self.root, filetypes=PROJECT_FILETYPES)
+        if not path:
+            return
+        try:
+            project = Project.load(path)
+        except ProjectError as error:
+            messagebox.showerror("Project", str(error), parent=self.root)
+            return
+        labels = {key: label for label, key in REMESHERS.items()}
+        for key, dotted in PROJECT_KEYS.items():
+            value = project.get(dotted)
+            if key == "remesher":
+                value = labels.get(value, next(iter(REMESHERS)))
+            elif key == "tile_size":
+                value = str(value or "auto")
+            elif key in ("faces", "resolution", "margin", "ao_samples", "bit_depth"):
+                value = str(value)
+            self.var[key].set(value)
+        self.project = project
+        for warning in project.warnings:
+            self._append_log(f"!! {warning}")
+        self._show_project_results()
+        self._project_saved = self._project_state()
+        self._show_project_name()
+        self._append_log(f"project: {project.path}")
+
+    def _show_project_results(self):
+        """Put a project's last outputs back into the viewport."""
+        self.last_output_path, self._scan_before = None, None
+        self.albedo_radio.configure(state="disabled")
+        self.preview_texture.set("lit")
+        scan = self.project.results.get("scan", {})
+        albedo = self.project.results.get("delight", {}).get("albedo")
+        if scan.get("glb") and os.path.isfile(scan["glb"]):
+            self._show_optimized_scan(scan["glb"], self.var["scan"].get() or None, self.var["photo"].get() or None)
+        elif albedo and os.path.isfile(albedo):
+            self.last_output_path = albedo
+            self.albedo_radio.configure(state="normal")
+            self.preview_texture.set("albedo")
+            self._refresh_viewport()
+        else:
+            self._refresh_viewport()
+
+    def _save_project(self, choose=False):
+        """Save to the open project's file, or ask for one. Returns True when saved."""
+        path = self.project.path if self.project and not choose else None
+        if path is None:
+            initial = os.path.splitext(os.path.basename(self.var["scan"].get() or self.var["lit"].get() or "untitled"))[0]
+            path = filedialog.asksaveasfilename(parent=self.root, filetypes=PROJECT_FILETYPES, defaultextension=PROJECT_SUFFIX,
+                                                initialfile=initial + PROJECT_SUFFIX)
+            if not path:
+                return False
+        project = self.project or Project(os.path.splitext(os.path.basename(path))[0])
+        try:
+            project.update(self._project_values())
+            project.save(path)
+        except (ProjectError, OSError) as error:
+            messagebox.showerror("Project", f"Not saved: {error}", parent=self.root)
+            return False
+        self.project = project
+        self._project_saved = self._project_state()
+        self._show_project_name()
+        self._append_log(f"project saved: {project.path}")
+        return True
+
+    def _record_result(self, kind, result):
+        """Note a run's outputs in the open project (saved with the project)."""
+        if self.project is not None:
+            self.project.results[kind] = {**result, "finished": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+    def _show_project_name(self):
+        name = os.path.basename(self.project.path) if self.project and self.project.path else "unsaved project"
+        self.project_label.configure(text=name)
+        self.root.title(f"delighter · {name}")
 
     def _value(self, key, cast=None):
         """A setting's value; numbers typed into an entry fall back to the default when invalid."""
@@ -234,71 +337,6 @@ class DelighterGUI:
 
     # ================================================================ styling helpers
 
-    def _pick_font(self):
-        families = set(tkfont.families(self.root))
-        return next((name for name in ("JetBrains Mono", "Cascadia Mono", "Consolas") if name in families), "Courier")
-
-    def _light_family(self):
-        """The light cut of the UI font, for the quiet half of the wordmark."""
-        light = f"{self.font_family} Light"
-        return light if light in set(tkfont.families(self.root)) else self.font_family
-
-    def _font(self, size=12, weight="normal"):
-        return ctk.CTkFont(family=self.font_family, size=size, weight=weight)
-
-    def _label(self, parent, text, color=DIM, size=12, weight="normal", **kwargs):
-        return ctk.CTkLabel(parent, text=text, text_color=color, font=self._font(size, weight), anchor="w", **kwargs)
-
-    def _button(self, parent, text, command, primary=False, width=0, **kwargs):
-        return ctk.CTkButton(
-            parent, text=f"[ {text.upper()} ]", command=command, corner_radius=0, border_width=1, height=28,
-            width=width or 0, font=self._font(12, "bold" if primary else "normal"),
-            fg_color=ACCENT if primary else "transparent", hover_color="#e6e6e6" if primary else "#141414",
-            text_color=BG if primary else TEXT, border_color=ACCENT if primary else BORDER,
-            text_color_disabled="#3a3a3a", **kwargs)
-
-    def _entry(self, parent, variable, width=0, **kwargs):
-        return ctk.CTkEntry(parent, textvariable=variable, corner_radius=0, border_width=1, height=26, width=width or 140,
-                            fg_color=FIELD, border_color=BORDER, text_color=TEXT, font=self._font(12), **kwargs)
-
-    def _option(self, parent, variable, values, width=0, command=None):
-        return ctk.CTkOptionMenu(parent, variable=variable, values=values, corner_radius=0, height=26, width=width or 140,
-                                 fg_color=FIELD, button_color="#1a1a1a", button_hover_color="#262626", text_color=TEXT,
-                                 dropdown_fg_color=FIELD, dropdown_text_color=TEXT, dropdown_hover_color=ACCENT_DIM,
-                                 font=self._font(12), dropdown_font=self._font(12), command=command)
-
-    def _check(self, parent, text, variable, command=None):
-        return ctk.CTkCheckBox(parent, text=text, variable=variable, corner_radius=0, border_width=1, checkbox_width=16,
-                               checkbox_height=16, fg_color=ACCENT, hover_color=ACCENT_DIM, border_color=BORDER_HI,
-                               checkmark_color=BG, text_color=TEXT, font=self._font(12), command=command)
-
-    def _segmented(self, parent, variable, values, command=None):
-        return ctk.CTkSegmentedButton(parent, variable=variable, values=values, corner_radius=0, height=26, border_width=1,
-                                      fg_color=BORDER, selected_color=ACCENT_DIM, selected_hover_color="#333333",
-                                      unselected_color=FIELD, unselected_hover_color="#161616", text_color=TEXT,
-                                      font=self._font(12), command=command)
-
-    # ---------------------------------------------------------------- sidebar rows
-
-    def _section(self, tab, title):
-        row = tab.next_row
-        rule = "─" * max(2, 44 - len(title))
-        self._label(tab, f"┌─ {title.upper()} {rule}", color=ACCENT, size=12, weight="bold").grid(
-            row=row, column=0, columnspan=2, sticky="ew", padx=10, pady=(14 if row else 6, 4))
-        tab.next_row += 1
-
-    def _row(self, tab, label, widget_factory, hint=None):
-        row = tab.next_row
-        self._label(tab, f"│ {label}", color=DIM).grid(row=row, column=0, sticky="w", padx=(10, 6), pady=2)
-        widget = widget_factory(tab)
-        widget.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=2)
-        tab.next_row += 1
-        if hint:
-            self._label(tab, f"│   {hint}", color=HINT, size=11).grid(row=tab.next_row, column=0, columnspan=2,
-                                                                         sticky="w", padx=(10, 6))
-            tab.next_row += 1
-        return widget
-
     def _path_row(self, tab, label, key, kind="file", filetypes=None, on_change=None):
         def build(parent):
             frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -310,27 +348,6 @@ class DelighterGUI:
             ctk.CTkButton(frame, text="…", width=28, height=26, corner_radius=0, border_width=1, border_color=BORDER,
                           fg_color=FIELD, hover_color="#1a1a1a", text_color=TEXT, font=self._font(12),
                           command=lambda: self._browse(key, kind, filetypes, on_change)).grid(row=0, column=1, padx=(4, 0))
-            return frame
-        return self._row(tab, label, build)
-
-    def _slider_row(self, tab, label, key, low, high, steps, fmt="{:.2f}"):
-        def build(parent):
-            frame = ctk.CTkFrame(parent, fg_color="transparent")
-            frame.grid_columnconfigure(0, weight=1)
-            readout = self._label(frame, "", color=TEXT, width=52)
-            slider = ctk.CTkSlider(frame, from_=low, to=high, number_of_steps=steps, variable=self.var[key], height=14,
-                                   corner_radius=0, button_corner_radius=0, button_length=6, fg_color=BORDER,
-                                   progress_color=ACCENT_DIM, button_color=ACCENT, button_hover_color="#e6e6e6")
-            slider.grid(row=0, column=0, sticky="ew")
-            readout.grid(row=0, column=1, padx=(8, 0))
-
-            def update(*_args):
-                try:
-                    readout.configure(text=fmt.format(self.var[key].get()))
-                except tk.TclError:
-                    pass
-            self.var[key].trace_add("write", update)
-            update()
             return frame
         return self._row(tab, label, build)
 
@@ -497,6 +514,17 @@ class DelighterGUI:
 
     def _build_input_tab(self, tab):
         images = [("Images", "*.png *.jpg *.jpeg *.tif *.tiff *.exr")]
+        self._section(tab, "project")
+        self.project_label = self._row(tab, "FILE", lambda parent: self._label(parent, "unsaved project", color=TEXT))
+
+        def project_buttons(parent):
+            frame = ctk.CTkFrame(parent, fg_color="transparent")
+            for column, (text, command) in enumerate((("new", self._new_project), ("open", self._open_project),
+                                                      ("save", self._save_project),
+                                                      ("save as", lambda: self._save_project(choose=True)))):
+                self._button(frame, text, command).grid(row=0, column=column, padx=(0, 4))
+            return frame
+        self._row(tab, "", project_buttons, hint=f"{PROJECT_SUFFIX}: inputs, settings, results")
         self._section(tab, "model")
         self._path_row(tab, "OBJ", "model", filetypes=[("OBJ mesh", "*.obj")], on_change=self._on_input_changed)
         self._section(tab, "maps")
@@ -563,6 +591,10 @@ class DelighterGUI:
         self._slider_row(tab, "SMART ANGLE", "smart_angle", 30, 89, 59, fmt="{:.0f}°")
         self._row(tab, "MARGIN PX", lambda parent: self._entry(parent, self.var["margin"], width=90))
         self._section(tab, "bake")
+        self._row(tab, "BACKEND", lambda parent: self._segmented(parent, self.var["backend"], ["auto", "blender", "native"]))
+        self._label(tab, "│   native: Embree + xatlas in Python, no Blender needed", color=HINT, size=11).grid(
+            row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
+        tab.next_row += 1
         self._row(tab, "TEXTURE SIZE", lambda parent: self._segmented(parent, self.var["resolution"], ["512", "1024", "2048", "4096"]))
         self._row(tab, "AO SAMPLES", lambda parent: self._entry(parent, self.var["ao_samples"], width=90))
         self._slider_row(tab, "CAGE", "cage", 0.001, 0.05, 49, fmt="{:.3f}")
@@ -663,6 +695,11 @@ class DelighterGUI:
                     "a": lambda: toggle("autorotate"), "<Control-l>": self._clear_log}
         for sequence, action in bindings.items():
             self.root.bind_all(sequence, guarded(action))
+        # Project shortcuts work while typing in a field too.
+        for sequence, action in {"<Control-n>": self._new_project, "<Control-o>": self._open_project,
+                                 "<Control-s>": self._save_project,
+                                 "<Control-S>": lambda: self._save_project(choose=True)}.items():
+            self.root.bind_all(sequence, lambda _event, action=action: (action(), "break")[1])
 
     # ================================================================ engine
 
@@ -835,7 +872,8 @@ class DelighterGUI:
             started = time.time()
             try:
                 out_file, dims, dev = self.engine.process_texture(lit, norm, ao, mask, output_path, log_callback=log_ui, **options)
-                self._post(lambda: self._on_success(out_file, time.time() - started))
+                result = {"albedo": out_file, "size": list(dims), "device": dev, "seconds": round(time.time() - started, 1)}
+                self._post(lambda: (self._record_result("delight", result), self._on_success(out_file, time.time() - started)))
             except Exception as e:
                 message = str(e)
                 self._post(lambda: self._on_error(message))
@@ -888,6 +926,7 @@ class DelighterGUI:
         remesher = self.var["remesher"].get()
         command = [self._scanopt_python(), "-u", SCANOPT_SCRIPT, scan, "--out", out, "--faces", str(faces),
                    "--remesher", REMESHERS[remesher], "--resolution", self.var["resolution"].get(),
+                   "--backend", self.var["backend"].get(),
                    "--unwrap", self.var["unwrap"].get(), "--smart-angle", f"{self._value('smart_angle', float):.1f}",
                    "--margin", str(numbers["margin"]), "--ao-samples", str(numbers["ao_samples"]),
                    "--cage", f"{self._value('cage', float):.4f}", "--max-ray", f"{self._value('max_ray', float):.4f}",
@@ -934,6 +973,10 @@ class DelighterGUI:
             if code == 0 and glb_path:
                 self._set_status("DONE", ACCENT)
                 self._append_log(f"scanopt done in {time.time() - started:.0f} s: {glb_path}")
+                stem = os.path.splitext(glb_path)[0]
+                self._record_result("scan", {"glb": glb_path, "obj": stem + ".obj", "report": stem + "_report.json",
+                                             "textures": os.path.join(os.path.dirname(glb_path), "textures"),
+                                             "seconds": round(time.time() - started, 1)})
                 self._show_optimized_scan(glb_path, *source)
             else:
                 self._set_status("SCANOPT FAILED", ERROR)
@@ -1133,4 +1176,6 @@ class DelighterGUI:
 
 if __name__ == "__main__":
     app = DelighterGUI()
+    if len(sys.argv) > 1 and sys.argv[1].lower().endswith(PROJECT_SUFFIX):
+        app.root.after(200, lambda: app._open_project(sys.argv[1]))  # double-clicked .bad file
     app.run()
