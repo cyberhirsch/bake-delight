@@ -5,10 +5,14 @@
 Remeshers: decimate (triangles, Blender QEM), quadwild (QuadWild + Bi-MDF quads,
 GPL-3.0 binary), autoremesher (AutoRemesher quads, MIT binary).
 
-Stages: Blender reduces and unwraps the mesh and bakes the photo, normals and AO
+Stages: the mesh is reduced and unwrapped and the photo, normals and AO are baked
 from the high-res surface; the de-lighter turns the baked photo into albedo; a
-heuristic derives roughness; Blender assembles the glTF PBR material and exports
-<name>.glb plus the individual texture PNGs.
+heuristic derives roughness; the glTF PBR asset is assembled and exported as
+<name>.glb plus <name>.obj and the individual texture PNGs.
+
+Backends (--backend): blender (Cycles bake, needs Blender) or native (trimesh,
+fast-simplification, xatlas and Embree in plain Python, no Blender). auto picks
+Blender when it is installed.
 """
 
 from __future__ import annotations
@@ -31,6 +35,10 @@ REPO = HERE.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "training"))
 from postprocess import rasterise_mask, read_exr, to_srgb, write_png16  # noqa: E402
+
+sys.path.insert(0, str(HERE))
+import native_stage  # noqa: E402
+from native_stage import fill_gutter  # noqa: E402
 
 DEFAULT_BLENDER = r"C:\Program Files\Blender Foundation\Blender 4.5\blender.exe"
 # Shown in the GUI dropdown, in this order. DJM (SIGGRAPH 2026) joins once its code is published.
@@ -56,20 +64,6 @@ def blender(executable: str, *arguments: str) -> None:
     if result.returncode != 0 or "Traceback" in result.stdout + result.stderr:
         log = (result.stdout + result.stderr)[-3000:]
         raise SystemExit(f"Blender stage failed:\n{log}")
-
-
-def fill_gutter(image: np.ndarray, mask: np.ndarray, pixels: int = 32) -> np.ndarray:
-    """Grow island colours into empty UV space so mipmaps and filtering do not bleed black."""
-    image = image.astype(np.float32).copy()
-    known = (mask > 0).astype(np.float32)
-    for _ in range(pixels):
-        weight = cv2.boxFilter(known, -1, (3, 3), normalize=False)
-        total = cv2.boxFilter(image * known[..., None], -1, (3, 3), normalize=False)
-        total = total.reshape(image.shape)  # OpenCV drops a single channel axis
-        grow = (known == 0) & (weight > 0)
-        image[grow] = total[grow] / weight[grow][:, None]
-        known[grow] = 1.0
-    return image
 
 
 def roughness_map(normal_ts: np.ndarray, ao: np.ndarray, mask: np.ndarray, base: float, strength: float) -> np.ndarray:
@@ -103,6 +97,8 @@ def main() -> int:
     parser.add_argument("--roughness", type=float, default=0.8, help="base roughness")
     parser.add_argument("--roughness-variation", type=float, default=0.25)
     parser.add_argument("--model", type=Path, help="de-lighter ONNX model (default: newest trained one)")
+    parser.add_argument("--backend", choices=["auto", "blender", "native"], default="auto",
+                        help="blender (Cycles bake) or native (Embree, no Blender); auto: Blender if installed")
     parser.add_argument("--blender", default=os.environ.get("BLENDER", DEFAULT_BLENDER))
     parser.add_argument("--quadwild", type=Path, help="QuadWild-BiMDF folder (default: QUADWILD_DIR or F:/DelighterData/tools/quadwild-bimdf)")
     parser.add_argument("--autoremesher", type=Path, help="AutoRemesher folder (default: AUTOREMESHER_DIR or F:/DelighterData/tools/autoremesher)")
@@ -120,6 +116,17 @@ def main() -> int:
     if args.topology:
         args.remesher = "quadwild" if args.topology == "quad" else "decimate"
     quads = args.remesher != "decimate"
+    args.input, args.out = args.input.resolve(), args.out.resolve()  # Blender resolves relative paths elsewhere
+    args.texture = args.texture.resolve() if args.texture else None
+    native = args.backend == "native" or (args.backend == "auto" and not Path(args.blender).is_file())
+    if native and (missing := native_stage.available()):
+        raise SystemExit(f"The native backend needs: {missing}")
+    if not native and not Path(args.blender).is_file():
+        raise SystemExit(f"Blender not found at {args.blender}; pass --blender or use --backend native")
+    print(f"backend: {'native (Embree)' if native else 'Blender ' + args.blender}", flush=True)
+    if native and args.unwrap == "smart":
+        print("Smart UV Project is a Blender tool; the native backend unwraps with xatlas", flush=True)
+        args.unwrap = "xatlas"
 
     model = args.model or next((p for p in MODEL_CANDIDATES if p.is_file()), None)
     if model is None:
@@ -128,16 +135,18 @@ def main() -> int:
     work = args.out / "work"
     work.mkdir(parents=True, exist_ok=True)
     timings, started = {}, time.time()
-    sys.path.insert(0, str(HERE))
 
-    quad_report = None
+    quad_report = quad_mesh = None
     prep = ["prep", "--input", str(args.input), "--out", str(work), "--topology", "quad" if quads else "tri",
             "--faces", str(args.faces), "--resolution", str(args.resolution), "--unwrap", args.unwrap,
             "--margin", str(args.margin), "--ao-samples", str(args.ao_samples), "--cage", str(args.cage),
             "--max-ray", str(args.max_ray), "--smart-angle", str(args.smart_angle)]
     if quads:
         print(f"[0/4] quad remeshing with {REMESHERS[args.remesher]} towards {args.faces} faces", flush=True)
-        blender(args.blender, "export-high", "--input", str(args.input), "--obj", str(work / "high.obj"))
+        if native:
+            native_stage.export_high(args.input, work / "high.obj")
+        else:
+            blender(args.blender, "export-high", "--input", str(args.input), "--obj", str(work / "high.obj"))
         if args.remesher == "quadwild":
             import quadwild as backend
             tool_dir = args.quadwild
@@ -149,9 +158,14 @@ def main() -> int:
         prep += ["--low-mesh", str(quad_mesh)]
         timings["remesh"] = time.time() - started
     print(f"[1/4] {'unwrapping' if quads else f'reducing to {args.faces} triangles, unwrapping'}, baking high->low", flush=True)
-    if args.texture:
-        prep += ["--texture", str(args.texture)]
-    blender(args.blender, *prep)
+    if native:
+        native_stage.prep(args.input, args.texture, work, args.faces, args.resolution, args.margin, args.cage, args.max_ray,
+                          args.ao_samples, low_mesh=quad_mesh if quads else None, topology="quad" if quads else "tri",
+                          log=lambda text: print(text, flush=True))
+    else:
+        if args.texture:
+            prep += ["--texture", str(args.texture)]
+        blender(args.blender, *prep)
     timings["bake"] = time.time() - started
 
     print(f"[2/4] de-lighting with {model}", flush=True)
@@ -181,8 +195,11 @@ def main() -> int:
 
     print("[4/4] assembling glTF PBR material", flush=True)
     glb = args.out / f"{name}.glb"
-    assemble = [str(work / "low.blend"), "assemble", "--out", str(work), "--export", str(glb)]
-    blender(args.blender, *assemble, *(["--keep-quads"] if quads else []))
+    if native:
+        native_stage.assemble(work, glb, name)  # the OBJ keeps quads; no FBX without Blender
+    else:
+        assemble = [str(work / "low.blend"), "assemble", "--out", str(work), "--export", str(glb)]
+        blender(args.blender, *assemble, *(["--keep-quads"] if quads else []))
 
     textures = args.out / "textures"
     textures.mkdir(exist_ok=True)
@@ -190,7 +207,7 @@ def main() -> int:
                            ("lit8.png", "lit")]:
         shutil.copy(work / source, textures / f"{name}_{target}.png")
     info = json.loads((work / "prep.json").read_text())
-    report = {**info, "remesher": args.remesher, "model": str(model), "delight_device": device, "quad_remesh": quad_report,
+    report = {"backend": "native" if native else "blender", **info, "remesher": args.remesher, "model": str(model), "delight_device": device, "quad_remesh": quad_report,
               "seconds": {k: round(v, 1) for k, v in {**timings, "total": time.time() - started}.items()}, "glb": str(glb)}
     (args.out / f"{name}_report.json").write_text(json.dumps(report, indent=2))
     if not args.keep_work:
