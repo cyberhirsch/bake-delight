@@ -51,15 +51,22 @@ class OBJMesh:
         if fields < 2 or b"//" in f[0]:
             raise ValueError("The OBJ must provide UV coordinates for every face.")
         corners = np.array(b" ".join(f).replace(b"/", b" ").split(), dtype=np.int64)
+        self._edges = None  # wireframe: index pairs into the drawn corners, built on first use for triangle meshes
         if len(corners) == len(f) * 3 * fields:  # all triangles
             corners = corners.reshape(-1, fields)
-        else:  # polygons: fan-triangulate line by line
-            triangles = []
+        else:  # polygons: fan-triangulate line by line; the wireframe keeps only the polygon outlines
+            triangles, edges = [], []
             for line in f:
                 polygon = np.array(line.replace(b"/", b" ").split(), dtype=np.int64).reshape(-1, fields)
+                base = len(triangles)
                 for index in range(1, len(polygon) - 1):
                     triangles += [polygon[0], polygon[index], polygon[index + 1]]
+                last = len(triangles) - 3
+                edges += [base, base + 1]                     # corner 0 - corner 1
+                edges += [k for t in range(base, last + 3, 3) for k in (t + 1, t + 2)]  # each fan triangle's outer edge
+                edges += [last + 2, base]                     # last corner - corner 0
             corners = np.array(triangles, dtype=np.int64)
+            self._edges = np.array(edges, dtype=np.uint32)
         position_indices = np.where(corners[:, 0] > 0, corners[:, 0] - 1, corners[:, 0] + len(source_positions))
         uv_indices = np.where(corners[:, 1] > 0, corners[:, 1] - 1, corners[:, 1] + len(source_uvs))
         if (position_indices.min() < 0 or position_indices.max() >= len(source_positions)
@@ -67,13 +74,21 @@ class OBJMesh:
             raise ValueError("The OBJ contains an out-of-range vertex or UV index.")
         points = source_positions[position_indices]
         uvs = source_uvs[uv_indices]
-        center = (points.min(axis=0) + points.max(axis=0)) * 0.5
-        radius = float(np.max(np.linalg.norm(points - center, axis=1)))
-        if radius <= 1e-8:
+        # Positions stay in file units; the viewport frames all its meshes with one transform so a
+        # high scan and its low mesh line up as they do in a DCC tool.
+        self.center = (points.min(axis=0) + points.max(axis=0)) * 0.5
+        self.radius = float(np.max(np.linalg.norm(points - self.center, axis=1)))
+        if self.radius <= 1e-8:
             raise ValueError("The OBJ has zero-sized geometry.")
-        points = (points - center) / radius
-        self.vertex_data = np.concatenate((points, uvs), axis=1)
+        self.vertex_data = np.concatenate((points, uvs), axis=1).astype(np.float32)
         self.vertex_count = len(position_indices)
+
+    @property
+    def edges(self):
+        if self._edges is None:  # triangles: all three sides are real edges
+            start = np.arange(0, self.vertex_count, 3, dtype=np.uint32)[:, None]
+            self._edges = (start + np.array([0, 1, 1, 2, 2, 0], dtype=np.uint32)).ravel()
+        return self._edges
 
     @staticmethod
     def _numbers(lines, columns):
@@ -168,6 +183,8 @@ class _Slot:
         self.image = None          # (width, height, RGBA bytes) awaiting upload
         self.texture_path = None
         self.vertex_buffer = None
+        self.edge_buffer = None
+        self.edge_count = 0
         self.uploaded_mesh = None
         self.texture_id = None
         self.uploaded_texture = None
@@ -287,6 +304,7 @@ class TextureViewport(OpenGLFrame):
                     slot.vertex_buffer = GL.glGenBuffers(1)
                 GL.glBindBuffer(GL.GL_ARRAY_BUFFER, slot.vertex_buffer)
                 GL.glBufferData(GL.GL_ARRAY_BUFFER, slot.mesh.vertex_data.nbytes, slot.mesh.vertex_data, GL.GL_STATIC_DRAW)
+                slot.edge_count = 0  # edges upload on the first wireframe draw
             slot.uploaded_mesh = slot.mesh
         if slot.image is not None:
             width, height, pixels = slot.image
@@ -386,6 +404,13 @@ class TextureViewport(OpenGLFrame):
         offset, _, _ = camera.axes()
         eye = camera.target + offset * camera.distance
         view = self._look_at(eye, camera.target, np.array([0, 1, 0], dtype=np.float32))
+        # Both slots share the frame of the left (high) mesh, else the right one: same units, same place.
+        frame = self.slots["a"].mesh or self.slots["b"].mesh
+        if frame is not None:
+            model = np.eye(4, dtype=np.float32)
+            model[:3, :3] /= frame.radius
+            model[:3, 3] = -frame.center / frame.radius
+            view = view @ model
         transform = projection @ view
 
         if self.mode == "wipe":
@@ -432,17 +457,29 @@ class TextureViewport(OpenGLFrame):
         GL.glVertexAttribPointer(position, 3, GL.GL_FLOAT, GL.GL_FALSE, stride, None)
         GL.glEnableVertexAttribArray(texcoord)
         GL.glVertexAttribPointer(texcoord, 2, GL.GL_FLOAT, GL.GL_FALSE, stride, ctypes.c_void_p(12))
+        wire = camera.wireframe or flat
+        if wire:
+            GL.glEnable(GL.GL_POLYGON_OFFSET_FILL)
+            GL.glPolygonOffset(1.0, 1.0)
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, slot.uploaded_mesh.vertex_count)
-        if camera.wireframe or flat:
-            # Second pass over the same triangles; OBJ polygons are fan-triangulated, so quads show a diagonal.
+        GL.glDisable(GL.GL_POLYGON_OFFSET_FILL)
+        if wire:
+            # The polygon outlines from the OBJ (no fan diagonals), drawn over the offset fill.
             GL.glUniform1i(GL.glGetUniformLocation(program, "mode"), 1)
             GL.glUniform4f(GL.glGetUniformLocation(program, "flat_color"), *camera.wire_color)
             GL.glEnable(GL.GL_BLEND)
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
             GL.glDepthFunc(GL.GL_LEQUAL)
-            GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_LINE)
-            GL.glDrawArrays(GL.GL_TRIANGLES, 0, slot.uploaded_mesh.vertex_count)
-            GL.glPolygonMode(GL.GL_FRONT_AND_BACK, GL.GL_FILL)
+            if slot.edge_count == 0:
+                edges = slot.uploaded_mesh.edges
+                if slot.edge_buffer is None:
+                    slot.edge_buffer = GL.glGenBuffers(1)
+                GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, slot.edge_buffer)
+                GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, edges.nbytes, edges, GL.GL_STATIC_DRAW)
+                slot.edge_count = len(edges)
+            GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, slot.edge_buffer)
+            GL.glDrawElements(GL.GL_LINES, slot.edge_count, GL.GL_UNSIGNED_INT, None)
+            GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, 0)
             GL.glDepthFunc(GL.GL_LESS)
             GL.glDisable(GL.GL_BLEND)
         GL.glDisableVertexAttribArray(position)
