@@ -102,6 +102,13 @@ class OBJMesh:
 _MESH_CACHE = {}
 
 
+def forget(path):
+    """Drop a file's parsed mesh so the next load reads it from disk again."""
+    path = os.path.abspath(path)
+    for key in [key for key in _MESH_CACHE if key[0] == path]:
+        _MESH_CACHE.pop(key)
+
+
 def load_obj(path):
     """Parse an OBJ once per file version; viewports share the result (safe to call from a worker thread)."""
     key = (os.path.abspath(path), os.path.getmtime(path))

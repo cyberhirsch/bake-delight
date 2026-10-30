@@ -19,10 +19,11 @@ from engine import DelighterInferenceEngine
 from tui import (ACCENT, ACCENT_DIM, BG, BORDER, BORDER_HI, DIM, ERROR, FIELD, HINT, PANEL, TEXT, TEXT_HI,  # noqa: F401
                  WARN, TuiWidgets)
 try:
-    from viewport import OPENGL_AVAILABLE, Camera, TextureViewport, load_obj
+    from viewport import OPENGL_AVAILABLE, Camera, TextureViewport, forget, load_obj
 except Exception:
     OPENGL_AVAILABLE = False
     TextureViewport = None
+    forget = lambda _path: None  # noqa: E731
 
 
 MODEL_FILENAME = "delighter_model_fp16.onnx"
@@ -355,10 +356,44 @@ class DelighterGUI(TuiWidgets):
             ctk.CTkButton(frame, text="…", width=28, height=26, corner_radius=0, border_width=1, border_color=BORDER,
                           fg_color=FIELD, hover_color="#1a1a1a", text_color=TEXT, font=self._font(12),
                           command=lambda: self._browse(key, kind, filetypes, on_change)).grid(row=0, column=1, padx=(4, 0))
-            for column, (text, command) in enumerate(extra, start=2):
+            for column, (text, command) in enumerate((("↻", lambda: self._reload_path(key, on_change)),
+                                                      ("×", lambda: self._clear_path(key, on_change))), start=2):
+                ctk.CTkButton(frame, text=text, width=28, height=26, corner_radius=0, border_width=1, border_color=BORDER,
+                              fg_color=FIELD, hover_color="#1a1a1a", text_color=TEXT, font=self._font(12),
+                              command=command).grid(row=0, column=column, padx=(4, 0))
+            for column, (text, command) in enumerate(extra, start=4):
                 self._button(frame, text, command).grid(row=0, column=column, padx=(4, 0))
             return frame
         return self._row(tab, label, build)
+
+    def _reload_path(self, key, on_change):
+        """Read the file again from disk, e.g. after it was edited in another program."""
+        path = self.var[key].get()
+        if not path:
+            return
+        forget(path)
+        for view in (self.viewport, self.viewport_before):
+            for slot in (view.slots.values() if view else ()):
+                slot.texture_path = None  # textures are re-read on the next refresh
+        self._append_log(f"{key}: reloaded {os.path.basename(path)}")
+        if key == "scan":
+            self._scan_before = None
+            if self._stage_view and self._stage_view["before"] == "scan":
+                self._load_scan_before(path, self.var["photo"].get().strip())
+        elif on_change and key != "lit":
+            on_change(key)
+            return
+        self._refresh_viewport()
+
+    def _clear_path(self, key, on_change):
+        """Unload: empty the field and let the owner react as to any other change."""
+        if not self.var[key].get():
+            return
+        self.var[key].set("")
+        if on_change:
+            on_change(key)
+        else:
+            self._append_log(f"{key}: unloaded")
 
     def _drop_path(self, event, key, on_change):
         files = self.root.tk.splitlist(event.data)
@@ -818,11 +853,12 @@ class DelighterGUI(TuiWidgets):
     # ================================================================ inputs
 
     def _on_input_changed(self, key):
-        if key == "model" and not self.var["model"].get().lower().endswith(".obj"):
+        value = self.var[key].get()
+        if key == "model" and value and not value.lower().endswith(".obj"):
             messagebox.showwarning("Model", "The 3D preview supports OBJ meshes only.", parent=self.root)
             return
         self._scan_before, self._stage_view, self._uv_layout = None, None, None
-        self._append_log(f"{key}: {os.path.basename(self.var[key].get())}")
+        self._append_log(f"{key}: {os.path.basename(value) if value else 'unloaded'}")
         if key == "lit":
             self._validate_resolution(self.var["lit"].get())
             self._auto_fill_other_maps(self.var["lit"].get())
@@ -830,7 +866,12 @@ class DelighterGUI(TuiWidgets):
 
     def _on_scan_chosen(self, _key):
         scan = self.var["scan"].get()
-        if scan and not self.var["scan_out"].get():
+        if not scan:  # unloaded: drop views that show it
+            self._append_log("scan: unloaded")
+            self._scan_before, self._stage_view, self._uv_layout = None, None, None
+            self._refresh_viewport()
+            return
+        if not self.var["scan_out"].get():
             self.var["scan_out"].set(os.path.join(os.path.dirname(scan), os.path.splitext(os.path.basename(scan))[0] + "_optimized"))
 
     def _validate_resolution(self, filepath):
