@@ -7,6 +7,7 @@ import threading
 import time
 import webbrowser
 import cv2
+import numpy as np
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -41,7 +42,7 @@ TABS = {"import": "1 IMPORT", "remesh": "2 REMESH", "uv": "3 UV", "bake": "4 BAK
         "export": "6 EXPORT", "view": "VIEW", "sys": "SYS"}
 STAGE_OF_TAB = {TABS[stage]: stage for stage in ("remesh", "uv", "bake", "delight", "export")}
 # Original scans above this size are not parsed for the before view; the baked photo is used instead.
-MAX_BEFORE_SCAN_BYTES = 400 * 1024 * 1024
+MAX_BEFORE_SCAN_BYTES = 2 * 1024 * 1024 * 1024  # an 880 MB OBJ (8 M triangles) loads in about 35 s
 BACKGROUNDS = {"Void": (0.0, 0.0, 0.0), "Charcoal": (0.04, 0.04, 0.04), "Graphite": (0.16, 0.16, 0.16),
                "Mid grey": (0.42, 0.42, 0.42), "Paper": (0.86, 0.86, 0.86)}
 
@@ -125,6 +126,8 @@ class DelighterGUI(TuiWidgets):
         self.viewport_before = None    # left view in side-by-side mode, same camera
         self.viewport_error = None
         self._scan_before = None       # (original scan OBJ, photo) once an optimised scan is shown
+        self._stage_view = None        # what a single stage's result compares: before / after slots and labels
+        self._uv_layout = None         # PIL image of the UV layout, shown beside the model after the UV stage
         self.project = None            # the open .bad project, if any
         self._project_saved = None     # its settings and results as last saved, to detect changes
         self._save_job = None
@@ -386,16 +389,9 @@ class DelighterGUI(TuiWidgets):
         top = ctk.CTkFrame(root, fg_color=PANEL, corner_radius=0, height=30, border_width=0)
         top.grid(row=0, column=0, columnspan=2, sticky="ew")
         top.grid_columnconfigure(1, weight=1)
-        # Wordmark: the half-lit disc, then BAKE& in full white and DELIGHT dimmed - lit / unlit.
-        mark = ctk.CTkFrame(top, fg_color="transparent")
-        mark.grid(row=0, column=0, padx=(10, 14), pady=4)
-        logo = self._logo_image(64)
-        ctk.CTkLabel(mark, text="", image=ctk.CTkImage(light_image=logo, dark_image=logo, size=(20, 20))).pack(side="left", padx=(0, 8))
-        self._label(mark, "BAKE&", color=TEXT_HI, size=15, weight="bold").pack(side="left")
-        ctk.CTkLabel(mark, text="DELIGHT", text_color=DIM, anchor="w",
-                     font=ctk.CTkFont(family=self._light_family(), size=15)).pack(side="left")
+        # The name and mark live in the title bar; the strip shows the workflow and the engine.
         self.top_info = self._label(top, "import → remesh → uv → bake → delight → export", color=HINT, size=12)
-        self.top_info.grid(row=0, column=1, sticky="w")
+        self.top_info.grid(row=0, column=1, sticky="w", padx=(10, 0), pady=4)
         self.engine_label = self._label(top, "engine: --", color=DIM, size=12)
         self.engine_label.grid(row=0, column=2, padx=12)
         self.status_label = self._label(top, "● INIT", color=WARN, size=12, weight="bold")
@@ -448,6 +444,8 @@ class DelighterGUI(TuiWidgets):
                 self.viewport = TextureViewport(self.views_frame, camera=camera, highlightthickness=0, bd=0)
                 self.viewport_before.set_mode("a")
                 self.viewport_before.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
+                self.uv_panel = tk.Label(self.views_frame, bg=BG, bd=0, highlightthickness=0)
+                self.uv_panel.bind("<Configure>", lambda _event: self._draw_uv_panel())
                 self.viewport.grid(row=0, column=1, sticky="nsew")
             except Exception as error:
                 self.viewport_error = str(error)
@@ -823,7 +821,7 @@ class DelighterGUI(TuiWidgets):
         if key == "model" and not self.var["model"].get().lower().endswith(".obj"):
             messagebox.showwarning("Model", "The 3D preview supports OBJ meshes only.", parent=self.root)
             return
-        self._scan_before = None
+        self._scan_before, self._stage_view, self._uv_layout = None, None, None
         self._append_log(f"{key}: {os.path.basename(self.var[key].get())}")
         if key == "lit":
             self._validate_resolution(self.var["lit"].get())
@@ -928,6 +926,7 @@ class DelighterGUI(TuiWidgets):
         self._refresh_run_buttons()
         self.albedo_radio.configure(state="normal")
         self.last_output_path = out_file
+        self._stage_view, self._uv_layout = None, None
         self._set_status("DONE", ACCENT)
         self._append_log(f"done in {seconds:.1f} s: {out_file}")
         if self.var["show_after_run"].get():
@@ -1048,25 +1047,60 @@ class DelighterGUI(TuiWidgets):
     def _show_stage_result(self, stage, work):
         """Preview what a single stage produced: the low mesh, its UV layout, the baked maps, the albedo."""
         path = lambda name: os.path.join(work, name)
+        scan, photo = self.var["scan"].get().strip(), self.var["photo"].get().strip()
         self.var["checker"].set(stage == "uv")
-        self.var["wireframe"].set(stage in ("remesh", "uv"))
-        if stage == "remesh":
+        self.var["wireframe"].set(stage == "uv")
+        self._uv_layout = None
+        if stage == "remesh":  # high scan | low mesh
             self.var["model"].set(path("low_preview.obj"))
-        elif stage == "uv":
+            self._stage_view = {"before": "scan", "after": (path("low_preview.obj"), None, "flat"), "labels": ("HIGH", "LOW")}
+            mode = VIEW_MODES[2]
+        elif stage == "uv":  # UV layout | model with checker
             self.var["model"].set(path("low_uv.obj"))
-        elif stage == "bake":
+            self._uv_layout = self._render_uv_layout(path("low_uv.obj"))
+            self._stage_view = {"before": (None, None, None), "after": (path("low_uv.obj"), None, None),
+                                "labels": ("UV LAYOUT", "MODEL")}
+            mode = VIEW_MODES[1]
+        elif stage == "bake":  # high scan | low mesh with the baked photo
             self.var["model"].set(path("low_uv.obj"))
             for key, name in (("lit", "lit.png"), ("normal", "normal_os.png"), ("ao", "ao.png"), ("mask", "mask.png")):
                 self.var[key].set(path(name))
-            self.preview_texture.set("lit")
-        elif stage == "delight":
+            self._stage_view = {"before": "scan", "after": (path("low_uv.obj"), path("lit.png"), None), "labels": ("HIGH", "BAKED")}
+            mode = VIEW_MODES[2]
+        else:  # delight: baked photo | albedo
             self.last_output_path = path("albedo_raw.png")
             self.albedo_radio.configure(state="normal")
-            self.preview_texture.set("albedo")
-        self._scan_before = None
+            self._stage_view = {"before": (path("low_uv.obj"), path("lit.png"), None),
+                                "after": (path("low_uv.obj"), path("albedo_raw.png"), None), "labels": ("LIT", "ALBEDO")}
+            mode = VIEW_MODES[2]
+        self.var["view_mode"].set(mode)
         self._refresh_viewport()
+        if self._stage_view["before"] == "scan" and (self._scan_before or (None,))[0] != scan:
+            self._scan_before = None
+            self._load_scan_before(scan, photo)
+
+    def _render_uv_layout(self, obj_path, size=1024):
+        """The low mesh's UV charts on the unit square: filled triangles with light edges."""
+        from PIL import ImageDraw
+        uv = load_obj(obj_path).vertex_data[:, 3:5].reshape(-1, 3, 2)
+        image = Image.new("RGB", (size, size), (10, 10, 10))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, size - 1, size - 1), outline=(60, 60, 60))
+        points = np.column_stack([uv[..., 0].ravel() * (size - 1), (1 - uv[..., 1].ravel()) * (size - 1)]).reshape(-1, 3, 2)
+        for triangle in points:
+            draw.polygon([tuple(corner) for corner in triangle], fill=(34, 34, 34), outline=(150, 150, 150))
+        return image
+
+    def _draw_uv_panel(self):
+        if self._uv_layout is None:
+            return
+        from PIL import ImageTk
+        side = max(16, min(self.uv_panel.winfo_width(), self.uv_panel.winfo_height()) - 8)
+        self._uv_photo = ImageTk.PhotoImage(self._uv_layout.resize((side, side), Image.Resampling.LANCZOS))
+        self.uv_panel.configure(image=self._uv_photo)
 
     def _show_optimized_scan(self, glb_path, scan=None, photo=None):
+        self._stage_view, self._uv_layout = None, None
         """Load the optimised OBJ into the 3D preview: the baked photo as before, the
         de-lighted albedo as after. The original scan replaces the before view once loaded."""
         stem = os.path.splitext(glb_path)[0]
@@ -1155,9 +1189,9 @@ class DelighterGUI(TuiWidgets):
         if mode not in VIEW_MODES:
             mode = VIEW_MODES[0]
         side_by_side = mode == VIEW_MODES[1]
-        hints = {VIEW_MODES[0]: "drag: orbit · wheel: zoom · space: before/after",
-                 VIEW_MODES[1]: "linked cameras · drag either view",
-                 VIEW_MODES[2]: "drag the line: compare · elsewhere: orbit"}
+        hints = {VIEW_MODES[0]: "L orbit · M pan · R/wheel zoom · space: before/after",
+                 VIEW_MODES[1]: "linked cameras · L orbit · M pan · R zoom",
+                 VIEW_MODES[2]: "drag the line: compare · L orbit · M pan · R zoom"}
         self.view_hint.configure(text=hints[mode])
         if mode == VIEW_MODES[0]:
             self.caption_before.grid_remove()
@@ -1170,10 +1204,16 @@ class DelighterGUI(TuiWidgets):
         if side_by_side:
             self.views_frame.grid_columnconfigure(0, weight=1, uniform="views")
             self.views_frame.grid_columnconfigure(1, weight=1, uniform="views")
-            self.viewport_before.grid()
+            if self._uv_layout is not None:
+                self.viewport_before.grid_remove()
+                self.uv_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
+            else:
+                self.uv_panel.grid_remove()
+                self.viewport_before.grid()
             self.viewport.set_mode("b")
         else:
             self.viewport_before.grid_remove()
+            self.uv_panel.grid_remove()
             self.views_frame.grid_columnconfigure(0, weight=0, uniform="")
             self.views_frame.grid_columnconfigure(1, weight=1, uniform="")
             self.viewport.set_mode("wipe" if mode == VIEW_MODES[2] else "a" if self.preview_texture.get() == "lit" else "b")
@@ -1181,9 +1221,14 @@ class DelighterGUI(TuiWidgets):
     def _comparison(self):
         """(mesh, texture) for before and after. Before is the original scan once an optimised
         scan is shown and it could be loaded, else the lit texture on the same mesh."""
+        if self._stage_view:
+            before = self._stage_view["before"]
+            if before == "scan":
+                before = (*self._scan_before, None) if self._scan_before else (None, None, None)
+            return before, self._stage_view["after"]
         model = self.var["model"].get()
-        before = self._scan_before or (model, self.var["lit"].get())
-        return before, (model, self.last_output_path)
+        before = (*self._scan_before, None) if self._scan_before else (model, self.var["lit"].get(), None)
+        return before, (model, self.last_output_path, None)
 
     def _refresh_viewport(self):
         if not self.viewport:
@@ -1207,8 +1252,10 @@ class DelighterGUI(TuiWidgets):
             return f"│ {name:<6} {slot.triangles:>9,} tris  {mesh}\n│        {texture}"
 
         self.stats_label.configure(text=describe("BEFORE", slots["a"], before) + "\n" + describe("AFTER", slots["b"], after))
-        self.caption_before.configure(text=f"◀ BEFORE · {slots['a'].triangles:,} tris")
-        self.caption_after.configure(text=f"AFTER · {slots['b'].triangles:,} tris ▶")
+        left, right = (self._stage_view or {}).get("labels", ("BEFORE", "AFTER"))
+        left_count = "" if left == "UV LAYOUT" and self._uv_layout is not None else f" · {slots['a'].triangles:,} tris"
+        self.caption_before.configure(text=f"◀ {left}{left_count}")
+        self.caption_after.configure(text=f"{right} · {slots['b'].triangles:,} tris ▶")
 
     # ================================================================ 2D compare
 

@@ -132,6 +132,21 @@ class Camera:
 
     def reset(self):
         self.yaw, self.pitch, self.distance = 25.0, 15.0, 3.0
+        self.target = np.zeros(3, dtype=np.float32)
+
+    def axes(self):
+        """Unit offset from the target to the eye, and the screen's right and up directions."""
+        yaw, pitch = math.radians(self.yaw), math.radians(self.pitch)
+        offset = np.array([math.cos(pitch) * math.sin(yaw), math.sin(pitch), math.cos(pitch) * math.cos(yaw)], dtype=np.float32)
+        right = np.cross(np.array([0, 1, 0], dtype=np.float32), offset)
+        right /= max(float(np.linalg.norm(right)), 1e-6)
+        return offset, right, np.cross(offset, right)
+
+    def pan(self, dx, dy, height):
+        """Move the target with the cursor: dx, dy in pixels of a view `height` pixels tall."""
+        _, right, up = self.axes()
+        scale = 2.0 * self.distance * math.tan(math.radians(self.fov) / 2.0) / max(1, height)
+        self.target = self.target - right * dx * scale + up * dy * scale
 
     def changed(self):
         for view in self.views:
@@ -150,6 +165,7 @@ class _Slot:
         self.texture_id = None
         self.uploaded_texture = None
         self.has_mipmaps = False
+        self.shading = None        # None: texture or checker per the camera; "flat": grey with wireframe
 
     @property
     def triangles(self):
@@ -202,9 +218,14 @@ class TextureViewport(OpenGLFrame):
         self.split = 0.5           # wipe position, fraction of the width from the left
         self._drag_start = None
         self._dragging_split = False
+        # Left: orbit (or move the wipe line) · middle: pan · right: zoom · wheel: zoom.
         self.bind("<ButtonPress-1>", self._begin_drag)
         self.bind("<B1-Motion>", self._drag)
         self.bind("<ButtonRelease-1>", self._end_drag)
+        for button, kind in (("2", "pan"), ("3", "zoom")):
+            self.bind(f"<ButtonPress-{button}>", lambda event, kind=kind: self._begin_move(event, kind))
+            self.bind(f"<B{button}-Motion>", self._move)
+            self.bind(f"<ButtonRelease-{button}>", self._end_drag)
         self.bind("<Motion>", self._hover)
         self.bind("<MouseWheel>", self._wheel)
         self.bind("<Button-4>", lambda event: self._zoom(-1))
@@ -229,10 +250,11 @@ class TextureViewport(OpenGLFrame):
 
     # ------------------------------------------------------------ content
 
-    def set_slot(self, slot, mesh_path=None, texture_path=None):
+    def set_slot(self, slot, mesh_path=None, texture_path=None, shading=None):
         """Show `mesh_path` with `texture_path` in slot "a" or "b". Parsing and decoding happen
         here, so errors reach the caller; the GL upload waits until the context exists."""
         target = self.slots[slot]
+        target.shading = shading
         target.mesh = load_obj(mesh_path) if mesh_path and os.path.isfile(mesh_path) else None
         if texture_path and os.path.isfile(texture_path):
             stamp = (texture_path, os.path.getmtime(texture_path))
@@ -309,16 +331,32 @@ class TextureViewport(OpenGLFrame):
             self.camera.pitch = max(-89.0, min(89.0, pitch + (event.y - y) * speed))
             self.camera.changed()
 
+    def _begin_move(self, event, kind):
+        self._move_kind, self._move_last = kind, (event.x, event.y)
+
+    def _move(self, event):
+        if not getattr(self, "_move_last", None):
+            return
+        x, y = self._move_last
+        self._move_last = (event.x, event.y)
+        camera = self.camera
+        if self._move_kind == "pan":
+            camera.pan(event.x - x, event.y - y, self.winfo_height())
+        else:  # drag down or right: closer
+            camera.distance = max(0.2, min(12.0, camera.distance * math.exp(-0.005 * ((event.y - y) + (event.x - x)))))
+        camera.changed()
+
     def _end_drag(self, _event):
         self._drag_start = None
         self._dragging_split = False
+        self._move_last = None
 
     def _wheel(self, event):
         self._zoom(-1 if event.delta > 0 else 1)
 
     def _zoom(self, direction):
         camera = self.camera
-        camera.distance = max(1.2, min(12.0, camera.distance * (1.0 / camera.zoom_step if direction < 0 else camera.zoom_step)))
+        camera.distance = max(0.2, min(12.0, camera.distance * (1.0 / camera.zoom_step if direction < 0 else camera.zoom_step)))
         camera.changed()
 
     # ------------------------------------------------------------ drawing
@@ -337,14 +375,10 @@ class TextureViewport(OpenGLFrame):
             self._sync(slot)
 
         camera = self.camera
-        projection = self._perspective(math.radians(camera.fov), width / height, 0.1, 100.0)
-        yaw, pitch = math.radians(camera.yaw), math.radians(camera.pitch)
-        eye = np.array([
-            camera.distance * math.cos(pitch) * math.sin(yaw),
-            camera.distance * math.sin(pitch),
-            camera.distance * math.cos(pitch) * math.cos(yaw),
-        ], dtype=np.float32)
-        view = self._look_at(eye, np.zeros(3, dtype=np.float32), np.array([0, 1, 0], dtype=np.float32))
+        projection = self._perspective(math.radians(camera.fov), width / height, 0.02, 100.0)
+        offset, _, _ = camera.axes()
+        eye = camera.target + offset * camera.distance
+        view = self._look_at(eye, camera.target, np.array([0, 1, 0], dtype=np.float32))
         transform = projection @ view
 
         if self.mode == "wipe":
@@ -364,12 +398,14 @@ class TextureViewport(OpenGLFrame):
 
     def _draw(self, slot, transform):
         camera = self.camera
-        if slot.uploaded_mesh is None or (slot.uploaded_texture is None and not camera.checker):
+        flat = slot.shading == "flat"
+        if slot.uploaded_mesh is None or (slot.uploaded_texture is None and not camera.checker and not flat):
             return
         program = self.program
         GL.glUseProgram(program)
         GL.glUniformMatrix4fv(GL.glGetUniformLocation(program, "transform"), 1, GL.GL_TRUE, transform)
-        GL.glUniform1i(GL.glGetUniformLocation(program, "mode"), 2 if camera.checker else 0)
+        GL.glUniform1i(GL.glGetUniformLocation(program, "mode"), 1 if flat else 2 if camera.checker else 0)
+        GL.glUniform4f(GL.glGetUniformLocation(program, "flat_color"), 0.2, 0.2, 0.2, 1.0)
         GL.glUniform1f(GL.glGetUniformLocation(program, "cells"), float(camera.checker_cells))
         if slot.uploaded_texture is not None:
             GL.glActiveTexture(GL.GL_TEXTURE0)
@@ -389,7 +425,7 @@ class TextureViewport(OpenGLFrame):
         GL.glEnableVertexAttribArray(texcoord)
         GL.glVertexAttribPointer(texcoord, 2, GL.GL_FLOAT, GL.GL_FALSE, stride, ctypes.c_void_p(12))
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, slot.uploaded_mesh.vertex_count)
-        if camera.wireframe:
+        if camera.wireframe or flat:
             # Second pass over the same triangles; OBJ polygons are fan-triangulated, so quads show a diagonal.
             GL.glUniform1i(GL.glGetUniformLocation(program, "mode"), 1)
             GL.glUniform4f(GL.glGetUniformLocation(program, "flat_color"), *camera.wire_color)
