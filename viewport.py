@@ -405,7 +405,8 @@ class TextureViewport(OpenGLFrame):
 
     def _draw(self, slot, transform):
         camera = self.camera
-        flat = slot.shading == "flat"
+        # Grey with wireframe when asked for, or when there is nothing to texture the mesh with.
+        flat = slot.shading == "flat" or (slot.texture_path is None and slot.uploaded_texture is None and not camera.checker)
         if slot.uploaded_mesh is None or (slot.uploaded_texture is None and not camera.checker and not flat):
             return
         program = self.program

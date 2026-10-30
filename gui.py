@@ -149,6 +149,7 @@ class DelighterGUI(TuiWidgets):
         self._apply_view_settings()
         self._start_autorotate()
         self._load_engine_async()
+        self._show_model_only()
         self._refresh_viewport()
 
     # ================================================================ threads
@@ -546,11 +547,9 @@ class DelighterGUI(TuiWidgets):
         self._show_tab()
 
     def _show_tab(self):
-        for name, tab in self.tabs.items():
-            if name == self.tab_var.get():
-                tab.grid()
-            else:
-                tab.grid_remove()
+        # All tabs stay laid out in one cell; raising one is instant, while unmapping and
+        # remapping a tab full of CustomTkinter widgets took 60-600 ms per switch.
+        self.tabs[self.tab_var.get()]._parent_frame.tkraise()
         self._refresh_run_buttons()
 
     def _refresh_run_buttons(self):
@@ -859,6 +858,9 @@ class DelighterGUI(TuiWidgets):
             return
         self._scan_before, self._stage_view, self._uv_layout = None, None, None
         self._append_log(f"{key}: {os.path.basename(value) if value else 'unloaded'}")
+        if key == "lit" and value:
+            self.var["checker"].set(False)
+        self._show_model_only()
         if key == "lit":
             self._validate_resolution(self.var["lit"].get())
             self._auto_fill_other_maps(self.var["lit"].get())
@@ -1120,6 +1122,21 @@ class DelighterGUI(TuiWidgets):
             self._scan_before = None
             self._load_scan_before(scan, photo)
 
+    def _show_model_only(self):
+        """A low-res mesh without a texture: its UV layout beside the model with the checker."""
+        model, lit = self.var["model"].get(), self.var["lit"].get()
+        if self._stage_view or not (model and os.path.isfile(model)) or (lit and os.path.isfile(lit)):
+            return
+        try:
+            self._uv_layout = self._render_uv_layout(model)
+        except Exception as error:  # no UVs: the model still shows, grey with wireframe
+            self._append_log(f"uv layout: {error}")
+            return
+        self._stage_view = {"before": (None, None, None), "after": (model, None, None), "labels": ("UV LAYOUT", "MODEL")}
+        self.var["checker"].set(True)
+        self.var["wireframe"].set(True)
+        self.var["view_mode"].set(VIEW_MODES[1])
+
     def _render_uv_layout(self, obj_path, size=1024):
         """The low mesh's UV charts on the unit square: filled triangles with light edges."""
         from PIL import ImageDraw
@@ -1248,6 +1265,7 @@ class DelighterGUI(TuiWidgets):
             if self._uv_layout is not None:
                 self.viewport_before.grid_remove()
                 self.uv_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
+                self.root.after_idle(self._draw_uv_panel)  # also when the panel keeps its size
             else:
                 self.uv_panel.grid_remove()
                 self.viewport_before.grid()
