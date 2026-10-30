@@ -40,6 +40,7 @@ sys.path.insert(0, str(HERE))
 import native_stage  # noqa: E402
 from native_stage import fill_gutter  # noqa: E402
 
+STAGES = ["remesh", "uv", "bake", "delight", "export"]
 DEFAULT_BLENDER = r"C:\Program Files\Blender Foundation\Blender 4.5\blender.exe"
 # Shown in the GUI dropdown, in this order. DJM (SIGGRAPH 2026) joins once its code is published.
 REMESHERS = {
@@ -110,8 +111,12 @@ def main() -> int:
     parser.add_argument("--max-ray", type=float, default=0.03, help="bake ray search distance, fraction of the bounds diagonal")
     parser.add_argument("--smart-angle", type=float, default=66.0, help="Smart UV Project angle limit, degrees")
     parser.add_argument("--tiled", action="store_true", help="de-light in overlapping tiles (less VRAM)")
+    parser.add_argument("--predecimate", type=float, default=2.0,
+                        help="quad mode: decimate the scan to this many times --faces before quad remeshing (0 = off)")
     parser.add_argument("--sharp", action="store_true", help="quad mode: keep sharp feature edges (hard-surface scans)")
     parser.add_argument("--keep-work", action="store_true", help="keep intermediate EXRs in <out>/work")
+    parser.add_argument("--stage", choices=["all", *STAGES], default="all",
+                        help="run one stage on the results of the earlier ones in <out>/work (kept), or all of them")
     args = parser.parse_args()
     if args.topology:
         args.remesher = "quadwild" if args.topology == "quad" else "decimate"
@@ -128,92 +133,152 @@ def main() -> int:
         print("Smart UV Project is a Blender tool; the native backend unwraps with xatlas", flush=True)
         args.unwrap = "xatlas"
 
-    model = args.model or next((p for p in MODEL_CANDIDATES if p.is_file()), None)
-    if model is None:
-        raise SystemExit("No de-lighter model found; pass --model")
     name = args.input.stem
     work = args.out / "work"
     work.mkdir(parents=True, exist_ok=True)
-    timings, started = {}, time.time()
+    stages = STAGES if args.stage == "all" else [args.stage]
+    state_path = work / "stages.json"
+    state = json.loads(state_path.read_text()) if state_path.is_file() and args.stage != "all" else {}
+    started = time.time()
 
-    quad_report = quad_mesh = None
+    def need(path: Path, stage: str):
+        if not path.is_file():
+            raise SystemExit(f"{path.name} is missing: run the {stage} stage first")
+
+    def done(stage: str, since: float, **values):
+        state[stage] = {**values, "seconds": round(time.time() - since, 1)}
+        state_path.write_text(json.dumps(state, indent=2, default=str))
+
+    for stage in stages:
+        since = time.time()
+        tag = f"[{STAGES.index(stage) + 1}/{len(STAGES)}]"
+        if stage == "remesh":
+            low = work / "low.obj"
+            if quads:
+                print(f"{tag} quad remeshing with {REMESHERS[args.remesher]} towards {args.faces} faces", flush=True)
+                target = round(args.predecimate * args.faces) if args.predecimate > 0 else 0
+                if native:
+                    remesh_faces = native_stage.export_high(args.input, work / "high.obj", target)
+                else:
+                    blender(args.blender, "export-high", "--input", str(args.input), "--obj", str(work / "high.obj"))
+                    remesh_faces = native_stage.predecimate(work / "high.obj", target) if target else None
+                if target:
+                    print(f"      pre-decimated to {remesh_faces} triangles for the remesher", flush=True)
+                if args.remesher == "quadwild":
+                    import quadwild as backend
+                    tool_dir = args.quadwild
+                else:
+                    import autoremesher as backend
+                    tool_dir = args.autoremesher
+                quad_mesh, quad_report = backend.remesh(work / "high.obj", args.faces, work / args.remesher,
+                                                        tool_dir=tool_dir or backend.DEFAULT_DIR, sharp=args.sharp)
+                shutil.copy(quad_mesh, low)
+            else:
+                print(f"{tag} reducing to {args.faces} triangles", flush=True)
+                native_stage.reduce_scan(args.input, args.faces, low)
+                quad_report = None
+            native_stage.write_preview_obj(low, args.input, work / "low_preview.obj")
+            print(f"      low mesh: {low}", flush=True)
+            done("remesh", since, remesher=args.remesher, topology="quad" if quads else "tri", quad_remesh=quad_report)
+
+        elif stage == "uv":
+            need(work / "low.obj", "remesh")
+            print(f"{tag} unwrapping ({args.unwrap})", flush=True)
+            if native:
+                info = native_stage.layout(work / "low.obj", args.input, work, args.resolution, args.margin,
+                                           log=lambda text: print(text, flush=True))
+                print(f"      uv mesh: {work / 'low_uv.obj'}", flush=True)
+            else:  # Blender unwraps and bakes in one pass; the bake stage then reuses it
+                print("      Blender backend: unwrap and bake run together", flush=True)
+                run_blender_prep(args, work, quads)
+                info = json.loads((work / "prep.json").read_text())
+            done("uv", since, unwrap=args.unwrap, resolution=args.resolution, charts=info.get("charts"))
+
+        elif stage == "bake":
+            print(f"{tag} baking high->low ({'Embree' if native else 'Cycles'})", flush=True)
+            if native:
+                need(work / "layout.npz", "uv")
+                native_stage.bake_layout(args.input, args.texture, work, args.cage, args.max_ray, args.ao_samples,
+                                         topology="quad" if quads else "tri", log=lambda text: print(text, flush=True))
+            elif not (work / "prep.json").is_file() or (work / "prep.json").stat().st_mtime < (work / "low.obj").stat().st_mtime:
+                need(work / "low.obj", "remesh")
+                run_blender_prep(args, work, quads)
+            write_delight_inputs(work, args.resolution)
+            print(f"      maps: {work / 'lit.png'}", flush=True)
+            done("bake", since)
+
+        elif stage == "delight":
+            need(work / "lit.png", "bake")
+            model = args.model or next((p for p in MODEL_CANDIDATES if p.is_file()), None)
+            if model is None:
+                raise SystemExit("No de-lighter model found; pass --model")
+            print(f"{tag} de-lighting with {model}", flush=True)
+            from engine import DelighterInferenceEngine  # the app's own inference path
+            engine = DelighterInferenceEngine(str(model))
+            _, _, device = engine.process_texture(str(work / "lit.png"), str(work / "normal_os.png"), str(work / "ao.png"),
+                                                  str(work / "mask.png"), str(work / "albedo_raw.png"), tiled_mode=args.tiled)
+            print(f"      albedo: {work / 'albedo_raw.png'}", flush=True)
+            done("delight", since, model=str(model), device=device)
+
+        elif stage == "export":
+            need(work / "albedo_raw.png", "delight")
+            print(f"{tag} roughness, gutter fill, assembling glTF PBR material", flush=True)
+            glb = export(args, work, name, native, quads)
+            done("export", since, glb=str(glb))
+            info = json.loads((work / "prep.json").read_text())
+            report = {"backend": "native" if native else "blender", **info, "remesher": args.remesher,
+                      "stages": state, "glb": str(glb)}
+            (args.out / f"{name}_report.json").write_text(json.dumps(report, indent=2, default=str))
+            if args.stage == "all" and not args.keep_work:
+                shutil.rmtree(work)
+            print(f"done: {glb}  ({info['source_faces']} -> {info['faces']} faces, {time.time() - started:.1f} s)", flush=True)
+    if args.stage != "all":
+        print(f"stage {args.stage} done ({time.time() - started:.1f} s)", flush=True)
+    return 0
+
+
+def run_blender_prep(args, work: Path, quads: bool) -> None:
     prep = ["prep", "--input", str(args.input), "--out", str(work), "--topology", "quad" if quads else "tri",
             "--faces", str(args.faces), "--resolution", str(args.resolution), "--unwrap", args.unwrap,
             "--margin", str(args.margin), "--ao-samples", str(args.ao_samples), "--cage", str(args.cage),
-            "--max-ray", str(args.max_ray), "--smart-angle", str(args.smart_angle)]
-    if quads:
-        print(f"[0/4] quad remeshing with {REMESHERS[args.remesher]} towards {args.faces} faces", flush=True)
-        if native:
-            native_stage.export_high(args.input, work / "high.obj")
-        else:
-            blender(args.blender, "export-high", "--input", str(args.input), "--obj", str(work / "high.obj"))
-        if args.remesher == "quadwild":
-            import quadwild as backend
-            tool_dir = args.quadwild
-        else:
-            import autoremesher as backend
-            tool_dir = args.autoremesher
-        quad_mesh, quad_report = backend.remesh(work / "high.obj", args.faces, work / args.remesher,
-                                                tool_dir=tool_dir or backend.DEFAULT_DIR, sharp=args.sharp)
-        prep += ["--low-mesh", str(quad_mesh)]
-        timings["remesh"] = time.time() - started
-    print(f"[1/4] {'unwrapping' if quads else f'reducing to {args.faces} triangles, unwrapping'}, baking high->low", flush=True)
-    if native:
-        native_stage.prep(args.input, args.texture, work, args.faces, args.resolution, args.margin, args.cage, args.max_ray,
-                          args.ao_samples, low_mesh=quad_mesh if quads else None, topology="quad" if quads else "tri",
-                          log=lambda text: print(text, flush=True))
-    else:
-        if args.texture:
-            prep += ["--texture", str(args.texture)]
-        blender(args.blender, *prep)
-    timings["bake"] = time.time() - started
+            "--max-ray", str(args.max_ray), "--smart-angle", str(args.smart_angle), "--low-mesh", str(work / "low.obj")]
+    if args.texture:
+        prep += ["--texture", str(args.texture)]
+    blender(args.blender, *prep)
 
-    print(f"[2/4] de-lighting with {model}", flush=True)
-    mask = rasterise_mask(np.load(work / "uv_tris.npy"), args.resolution)
-    lit, normal_os, normal_ts = (read_exr(work / f) for f in ("lit.exr", "normal_os.exr", "normal_ts.exr"))
-    ao = read_exr(work / "ao.exr")[..., 0]
-    write_png16(work / "lit.png", to_srgb(lit))
-    write_png16(work / "normal_os.png", normal_os)
-    write_png16(work / "ao.png", ao)
+
+def write_delight_inputs(work: Path, resolution: int) -> None:
+    """The baked EXRs as the de-lighter's inputs (16-bit PNGs) plus the UV coverage mask."""
+    mask = rasterise_mask(np.load(work / "uv_tris.npy"), resolution)
+    write_png16(work / "lit.png", to_srgb(read_exr(work / "lit.exr")))
+    write_png16(work / "normal_os.png", read_exr(work / "normal_os.exr"))
+    write_png16(work / "ao.png", read_exr(work / "ao.exr")[..., 0])
     cv2.imwrite(str(work / "mask.png"), mask)
 
-    from engine import DelighterInferenceEngine  # the app's own inference path
-    engine = DelighterInferenceEngine(str(model))
-    stage = time.time()
-    albedo_path, _, device = engine.process_texture(str(work / "lit.png"), str(work / "normal_os.png"), str(work / "ao.png"),
-                                                    str(work / "mask.png"), str(work / "albedo_raw.png"), tiled_mode=args.tiled)
-    timings["delight"] = time.time() - stage
 
-    print("[3/4] roughness, gutter fill", flush=True)
-    albedo = cv2.cvtColor(cv2.imread(albedo_path), cv2.COLOR_BGR2RGB).astype(np.float32) / 255
+def export(args, work: Path, name: str, native: bool, quads: bool) -> Path:
+    mask = cv2.imread(str(work / "mask.png"), cv2.IMREAD_GRAYSCALE)
+    lit, normal_ts = read_exr(work / "lit.exr"), read_exr(work / "normal_ts.exr")
+    ao = read_exr(work / "ao.exr")[..., 0]
+    albedo = cv2.cvtColor(cv2.imread(str(work / "albedo_raw.png")), cv2.COLOR_BGR2RGB).astype(np.float32) / 255
     write_png8(work / "albedo.png", fill_gutter(albedo, mask))
     write_png8(work / "lit8.png", fill_gutter(to_srgb(lit), mask))  # the photo before de-lighting, for comparison
-    write_png8(work / "normal.png", normal_ts)  # Blender already extended these into the gutter
+    write_png8(work / "normal.png", normal_ts)  # already extended into the gutter by the bake
     write_png8(work / "ao8.png", np.clip(ao, 0, 1))
-    shutil.copy(work / "ao8.png", work / "ao.png")
     write_png8(work / "roughness.png", fill_gutter(roughness_map(normal_ts, ao, mask, args.roughness, args.roughness_variation)[..., None], mask)[..., 0])
-
-    print("[4/4] assembling glTF PBR material", flush=True)
     glb = args.out / f"{name}.glb"
     if native:
         native_stage.assemble(work, glb, name)  # the OBJ keeps quads; no FBX without Blender
     else:
+        shutil.copy(work / "ao8.png", work / "ao.png")  # the Blender material reads ao.png
         assemble = [str(work / "low.blend"), "assemble", "--out", str(work), "--export", str(glb)]
         blender(args.blender, *assemble, *(["--keep-quads"] if quads else []))
-
     textures = args.out / "textures"
     textures.mkdir(exist_ok=True)
-    for source, target in [("albedo.png", "albedo"), ("normal.png", "normal_gl"), ("roughness.png", "roughness"), ("ao.png", "ao"),
-                           ("lit8.png", "lit")]:
+    for source, target in [("albedo.png", "albedo"), ("normal.png", "normal_gl"), ("roughness.png", "roughness"),
+                           ("ao8.png", "ao"), ("lit8.png", "lit")]:
         shutil.copy(work / source, textures / f"{name}_{target}.png")
-    info = json.loads((work / "prep.json").read_text())
-    report = {"backend": "native" if native else "blender", **info, "remesher": args.remesher, "model": str(model), "delight_device": device, "quad_remesh": quad_report,
-              "seconds": {k: round(v, 1) for k, v in {**timings, "total": time.time() - started}.items()}, "glb": str(glb)}
-    (args.out / f"{name}_report.json").write_text(json.dumps(report, indent=2))
-    if not args.keep_work:
-        shutil.rmtree(work)
-    print(f"done: {glb}  ({info['source_faces']} -> {info['faces']} faces, {report['seconds']['total']} s)", flush=True)
-    return 0
+    return glb
 
 
 if __name__ == "__main__":

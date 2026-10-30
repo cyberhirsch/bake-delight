@@ -64,26 +64,76 @@ def vertex_normals(positions: np.ndarray, faces: np.ndarray) -> np.ndarray:
     return normals / np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-20)
 
 
+def _numbers(lines: list[bytes], columns: int, dtype) -> np.ndarray:
+    """The first `columns` numbers of each line (prefix already stripped), parsed in one pass."""
+    values = np.array(b" ".join(lines).split(), dtype=dtype)
+    if len(values) % len(lines):  # mixed record lengths (optional w, vertex colours)
+        return np.array([line.split()[:columns] for line in lines], dtype)
+    return values.reshape(len(lines), -1)[:, :columns]
+
+
+def read_obj(path: Path):
+    """Positions, triangles and per-corner UVs (or None) of an OBJ. trimesh's reader needs tens of
+    minutes for a scan of several hundred MB; this one parses each record type with numpy in one go."""
+    v, vt, f = [], [], []
+    with path.open("rb") as handle:
+        for line in handle:
+            if line[:2] == b"v ":
+                v.append(line[2:])
+            elif line[:3] == b"vt ":
+                vt.append(line[3:])
+            elif line[:2] == b"f ":
+                f.append(line[2:])
+    if not f:
+        return np.zeros((0, 3)), np.zeros((0, 3), np.int64), None
+    positions = _numbers(v, 3, np.float64)
+    texcoords = _numbers(vt, 2, np.float64) if vt else None
+    del v, vt
+    fields = f[0].split()[0].count(b"/") + 1
+    text = b" ".join(f).replace(b"//", b"/0/").replace(b"/", b" ")
+    corners = np.array(text.split(), np.int64)
+    if len(corners) == len(f) * 3 * fields:
+        corners = corners.reshape(-1, 3, fields)
+    else:  # polygons: fan-triangulate line by line
+        triangles = []
+        for line in f:
+            polygon = np.array(line.replace(b"//", b"/0/").replace(b"/", b" ").split(), np.int64).reshape(-1, fields)
+            triangles += [(polygon[0], polygon[k], polygon[k + 1]) for k in range(1, len(polygon) - 1)]
+        corners = np.array(triangles, np.int64)
+    faces = corners[..., 0]
+    faces = np.where(faces < 0, faces + len(positions), faces - 1)
+    corner_uv = None
+    if texcoords is not None and fields > 1:
+        uv_index = corners[..., 1]
+        corner_uv = texcoords[np.where(uv_index < 0, uv_index + len(texcoords), uv_index - 1)]
+    return positions, faces, corner_uv
+
+
 def load_scan(path: Path, texture: Path | None):
     """The scan as welded triangles plus per-corner UVs, and its photo (linear RGB float32)."""
     import trimesh
     if path.suffix.lower() == ".fbx":
         raise SystemExit("FBX scans need the Blender backend; convert the scan to OBJ, PLY or GLB")
-    mesh = trimesh.load(str(path), force="mesh", process=False)
-    if not len(mesh.faces):
+    mesh = None
+    if path.suffix.lower() == ".obj":
+        positions, faces, corner_uv = read_obj(path)
+    else:
+        mesh = trimesh.load(str(path), force="mesh", process=False)
+        positions, faces = np.asarray(mesh.vertices, np.float64), np.asarray(mesh.faces, np.int64)
+        uv = getattr(mesh.visual, "uv", None)
+        corner_uv = None if uv is None or len(uv) != len(positions) else np.asarray(uv, np.float64)[faces]
+    if not len(faces):
         raise SystemExit("The file contains no meshes")
-    positions = np.asarray(mesh.vertices, np.float64)
-    faces = np.asarray(mesh.faces, np.int64)
-    uv = getattr(mesh.visual, "uv", None)
-    if uv is None or len(uv) != len(positions):
+    if corner_uv is None:
         raise SystemExit("The scan has no UVs, so its photo texture cannot be transferred")
-    corner_uv = np.asarray(uv, np.float64)[faces]
     if texture:
         photo = cv2.imread(str(texture), cv2.IMREAD_UNCHANGED)
         if photo is None:
             raise SystemExit(f"Cannot read the photo texture {texture}")
         photo = cv2.cvtColor(photo[..., :3] if photo.ndim == 3 else photo, cv2.COLOR_BGR2RGB if photo.ndim == 3 else cv2.COLOR_GRAY2RGB)
     else:
+        if mesh is None:  # OBJ: the material's texture is resolved by trimesh
+            mesh = trimesh.load(str(path), force="mesh", process=False)
         material = getattr(mesh.visual, "material", None)
         image = getattr(material, "baseColorTexture", None) or getattr(material, "image", None)
         if image is None:
@@ -103,17 +153,39 @@ def srgb_to_linear(x: np.ndarray) -> np.ndarray:
     return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4).astype(np.float32)
 
 
-def export_high(scan: Path, obj: Path) -> int:
-    """Welded triangle OBJ of the scan for the external quad remeshers (axes as on disk)."""
-    import trimesh
-    if scan.suffix.lower() == ".fbx":
-        raise SystemExit("FBX scans need the Blender backend; convert the scan to OBJ, PLY or GLB")
-    mesh = trimesh.load(str(scan), force="mesh", process=False)
-    positions, faces, _ = weld(np.asarray(mesh.vertices, np.float64), np.asarray(mesh.faces, np.int64))
+def write_triangle_obj(obj: Path, positions: np.ndarray, faces: np.ndarray):
     obj.parent.mkdir(parents=True, exist_ok=True)
     with obj.open("w", encoding="ascii") as handle:
         handle.write("".join(f"v {x:.7g} {y:.7g} {z:.7g}\n" for x, y, z in positions))
         handle.write("".join(f"f {a} {b} {c}\n" for a, b, c in faces + 1))
+
+
+def predecimate(obj: Path, target: int) -> int:
+    """Reduce a triangle OBJ in place to `target` faces (skipped when it is already smaller)."""
+    positions, faces, _ = read_obj(obj)
+    positions, faces, _ = weld(positions, faces)
+    if len(faces) > target:
+        positions, faces = decimate(positions, faces, target)
+        write_triangle_obj(obj, positions, faces)
+    return len(faces)
+
+
+def export_high(scan: Path, obj: Path, target: int = 0) -> int:
+    """Welded triangle OBJ of the scan for the external quad remeshers (axes as on disk),
+    QEM-decimated to `target` faces first when given: the remeshers then run in seconds instead of
+    minutes on multi-million-face scans, and the bake still projects from the full scan."""
+    import trimesh
+    if scan.suffix.lower() == ".fbx":
+        raise SystemExit("FBX scans need the Blender backend; convert the scan to OBJ, PLY or GLB")
+    if scan.suffix.lower() == ".obj":
+        positions, faces, _ = read_obj(scan)
+    else:
+        mesh = trimesh.load(str(scan), force="mesh", process=False)
+        positions, faces = np.asarray(mesh.vertices, np.float64), np.asarray(mesh.faces, np.int64)
+    positions, faces, _ = weld(positions, faces)
+    if target:
+        positions, faces = decimate(positions, faces, target)
+    write_triangle_obj(obj, positions, faces)
     return len(faces)
 
 
@@ -411,12 +483,64 @@ def write_exr(path: Path, rgb: np.ndarray) -> None:
 
 # ---------------------------------------------------------------- modes
 
+def reduce_scan(scan: Path, faces: int, obj: Path) -> int:
+    """Triangle route of the remesh stage: the scan QEM-decimated to `faces`, as an OBJ in disk axes
+    (the same convention as the quad remeshers' output)."""
+    return export_high(scan, obj, faces)
+
+
+def write_preview_obj(low_mesh: Path, scan: Path, obj: Path) -> None:
+    """The remeshed low mesh for the app's viewer, which needs UVs: one placeholder UV, Y-up like the final OBJ."""
+    positions, sizes, loop_verts = read_polygon_obj(low_mesh)
+    axes = TO_BLENDER if scan.suffix.lower() in Y_UP else np.eye(3)
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    with obj.open("w", encoding="ascii") as handle:
+        handle.write("".join(f"v {x:.7g} {y:.7g} {z:.7g}\n" for x, y, z in positions @ (BLENDER_TO_YUP @ axes).T))
+        handle.write("vt 0.5 0.5\n")
+        handle.write("".join("f " + " ".join(f"{loop_verts[k] + 1}/1" for k in range(start, start + size)) + "\n"
+                             for start, size in zip(starts, sizes)))
+
+
+def layout(low_mesh: Path, scan: Path, out: Path, resolution: int, margin: int, log=print) -> dict:
+    """UV stage: unwrap and pack the low mesh. Writes layout.npz for the bake stage and low_uv.obj
+    (Y-up like the final OBJ) for the preview."""
+    out.mkdir(parents=True, exist_ok=True)
+    positions, sizes, loop_verts = read_polygon_obj(low_mesh)
+    tri_loops, tri_poly = fan(sizes)
+    loop_uv, unwrap_info = unwrap(positions, loop_verts, tri_loops, tri_poly, resolution, margin)
+    log(f"UNWRAP {unwrap_info}")
+    np.savez(out / "layout.npz", positions=positions, sizes=sizes, loop_verts=loop_verts, loop_uv=loop_uv,
+             resolution=resolution, margin=margin, info=json.dumps(unwrap_info))
+    axes = TO_BLENDER if scan.suffix.lower() in Y_UP else np.eye(3)
+    shown = positions @ (BLENDER_TO_YUP @ axes).T
+    starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+    with (out / "low_uv.obj").open("w", encoding="ascii") as handle:
+        handle.write("".join(f"v {x:.7g} {y:.7g} {z:.7g}\n" for x, y, z in shown))
+        handle.write("".join(f"vt {u:.6f} {v:.6f}\n" for u, v in loop_uv))
+        handle.write("".join("f " + " ".join(f"{loop_verts[k] + 1}/{k + 1}" for k in range(start, start + size)) + "\n"
+                             for start, size in zip(starts, sizes)))
+    return unwrap_info
+
+
+def bake_layout(scan: Path, texture: Path | None, out: Path, cage: float, max_ray: float, ao_samples: int,
+                topology: str = "tri", log=print) -> dict:
+    """Bake stage: project the scan onto the unwrapped low mesh from layout.npz."""
+    saved = np.load(out / "layout.npz")
+    positions, sizes, loop_verts, loop_uv = saved["positions"], saved["sizes"], saved["loop_verts"], saved["loop_uv"]
+    resolution, unwrap_info = int(saved["resolution"]), json.loads(str(saved["info"]))
+    margin = int(saved["margin"])
+    tri_loops, _ = fan(sizes)
+    raw_pos, raw_faces, corner_uv, photo = load_scan(scan, texture)
+    high_pos, high_faces, _ = weld(raw_pos, raw_faces)
+    return _bake_and_write(scan, out, high_pos, high_faces, corner_uv, photo, positions, sizes, loop_verts, loop_uv,
+                           tri_loops, unwrap_info, resolution, margin, cage, max_ray, ao_samples, topology, log)
+
+
 def prep(scan: Path, texture: Path | None, out: Path, faces: int, resolution: int, margin: int, cage: float,
          max_ray: float, ao_samples: int, low_mesh: Path | None = None, topology: str = "tri", log=print) -> dict:
     out.mkdir(parents=True, exist_ok=True)
     raw_pos, raw_faces, corner_uv, photo = load_scan(scan, texture)
     high_pos, high_faces, _ = weld(raw_pos, raw_faces)
-    source_faces = len(high_faces)
     if low_mesh:
         positions, sizes, loop_verts = read_polygon_obj(low_mesh)
     else:
@@ -425,7 +549,13 @@ def prep(scan: Path, texture: Path | None, out: Path, faces: int, resolution: in
     tri_loops, tri_poly = fan(sizes)
     loop_uv, unwrap_info = unwrap(positions, loop_verts, tri_loops, tri_poly, resolution, margin)
     log(f"UNWRAP {unwrap_info}")
+    return _bake_and_write(scan, out, high_pos, high_faces, corner_uv, photo, positions, sizes, loop_verts, loop_uv,
+                           tri_loops, unwrap_info, resolution, margin, cage, max_ray, ao_samples, topology, log)
 
+
+def _bake_and_write(scan, out, high_pos, high_faces, corner_uv, photo, positions, sizes, loop_verts, loop_uv, tri_loops,
+                    unwrap_info, resolution, margin, cage, max_ray, ao_samples, topology, log) -> dict:
+    source_faces = len(high_faces)
     axes = TO_BLENDER if scan.suffix.lower() in Y_UP else np.eye(3)
     maps = bake((high_pos, high_faces, corner_uv), (positions, loop_verts, loop_uv, tri_loops), photo,
                 resolution, cage, max_ray, ao_samples, log=log)

@@ -36,6 +36,10 @@ REMESHERS = {
     "Quads - QuadWild + Bi-MDF (GPL)": "quadwild",
 }
 VIEW_MODES = ["Single", "Side by side", "A/B wipe"]
+# Sidebar tabs in workflow order; the numbered ones are pipeline stages with their own run button.
+TABS = {"import": "1 IMPORT", "remesh": "2 REMESH", "uv": "3 UV", "bake": "4 BAKE", "delight": "5 DELIGHT",
+        "export": "6 EXPORT", "view": "VIEW", "sys": "SYS"}
+STAGE_OF_TAB = {TABS[stage]: stage for stage in ("remesh", "uv", "bake", "delight", "export")}
 # Original scans above this size are not parsed for the before view; the baked photo is used instead.
 MAX_BEFORE_SCAN_BYTES = 400 * 1024 * 1024
 BACKGROUNDS = {"Void": (0.0, 0.0, 0.0), "Charcoal": (0.04, 0.04, 0.04), "Graphite": (0.16, 0.16, 0.16),
@@ -52,7 +56,7 @@ DEFAULTS = {
     "scan": "", "photo": "", "scan_out": "", "remesher": next(iter(REMESHERS)), "faces": "10000",
     "resolution": "2048", "backend": "auto", "unwrap": "xatlas", "smart_angle": 66.0, "margin": "16", "ao_samples": "64",
     "cage": 0.01, "max_ray": 0.03, "roughness": 0.8, "roughness_variation": 0.25,
-    "sharp": False, "scan_tiled": False, "keep_work": False,
+    "predecimate": 2.0, "sharp": False, "scan_tiled": False, "keep_work": False,
     # view
     "view_mode": VIEW_MODES[0], "fov": 50.0, "wireframe": False, "checker": False, "checker_cells": "32",
     "texture_filter": "mipmap", "background": "Charcoal", "orbit_speed": 0.5, "zoom_step": 1.14,
@@ -69,14 +73,14 @@ PROJECT_KEYS = {
                                          "force_cpu", "tiled", "tile_size", "tile_overlap", "bit_depth", "apply_mask")},
     **{key: f"scan.{key}" for key in ("scan", "photo", "remesher", "faces", "resolution", "backend", "unwrap", "smart_angle",
                                       "margin", "ao_samples", "cage", "max_ray", "roughness", "roughness_variation",
-                                      "sharp", "keep_work")},
+                                      "predecimate", "sharp", "keep_work")},
     "scan_out": "scan.out", "scan_tiled": "scan.tiled",
 }
 PROJECT_FILETYPES = [("Bake & Delight project", f"*{PROJECT_SUFFIX}")]
 
 KEYMAP = [
     ("Ctrl+N / O / S", "new / open / save project"), ("Ctrl+Shift+S", "save project as"),
-    ("F5", "run de-light"), ("F6", "run scan optimiser"), ("1 / 2 / 3", "single / side by side / wipe"),
+    ("F5", "run the current tab's stage"), ("F6", "run all stages"), ("1 / 2 / 3", "single / side by side / wipe"),
     ("Space", "single view: before <-> after"), ("W", "wireframe"), ("C", "UV checker"),
     ("R", "reset camera"), ("A", "auto-rotate"), ("Ctrl+L", "clear log"),
 ]
@@ -97,7 +101,7 @@ class DelighterGUI(TuiWidgets):
         ctk.set_window_scaling(0.88)
 
         self.root = CTkApp(fg_color=BG)
-        self.root.title("delighter")
+        self.root.title("BAKE&DELIGHT")
         self.root.geometry("1440x880")
         self.root.minsize(1100, 700)
         self.font_family = self._pick_font()
@@ -324,7 +328,7 @@ class DelighterGUI(TuiWidgets):
     def _show_project_name(self):
         name = os.path.basename(self.project.path) if self.project and self.project.path else "unsaved project"
         self.project_label.configure(text=name)
-        self.root.title(f"delighter · {name}")
+        self.root.title(f"BAKE&DELIGHT · {name}")
 
     def _value(self, key, cast=None):
         """A setting's value; numbers typed into an entry fall back to the default when invalid."""
@@ -337,7 +341,7 @@ class DelighterGUI(TuiWidgets):
 
     # ================================================================ styling helpers
 
-    def _path_row(self, tab, label, key, kind="file", filetypes=None, on_change=None):
+    def _path_row(self, tab, label, key, kind="file", filetypes=None, on_change=None, extra=()):
         def build(parent):
             frame = ctk.CTkFrame(parent, fg_color="transparent")
             frame.grid_columnconfigure(0, weight=1)
@@ -348,6 +352,8 @@ class DelighterGUI(TuiWidgets):
             ctk.CTkButton(frame, text="…", width=28, height=26, corner_radius=0, border_width=1, border_color=BORDER,
                           fg_color=FIELD, hover_color="#1a1a1a", text_color=TEXT, font=self._font(12),
                           command=lambda: self._browse(key, kind, filetypes, on_change)).grid(row=0, column=1, padx=(4, 0))
+            for column, (text, command) in enumerate(extra, start=2):
+                self._button(frame, text, command).grid(row=0, column=column, padx=(4, 0))
             return frame
         return self._row(tab, label, build)
 
@@ -380,15 +386,15 @@ class DelighterGUI(TuiWidgets):
         top = ctk.CTkFrame(root, fg_color=PANEL, corner_radius=0, height=30, border_width=0)
         top.grid(row=0, column=0, columnspan=2, sticky="ew")
         top.grid_columnconfigure(1, weight=1)
-        # Wordmark: the half-lit disc, then DE in full white and LIGHTER dimmed - lit / unlit.
+        # Wordmark: the half-lit disc, then BAKE& in full white and DELIGHT dimmed - lit / unlit.
         mark = ctk.CTkFrame(top, fg_color="transparent")
         mark.grid(row=0, column=0, padx=(10, 14), pady=4)
         logo = self._logo_image(64)
         ctk.CTkLabel(mark, text="", image=ctk.CTkImage(light_image=logo, dark_image=logo, size=(20, 20))).pack(side="left", padx=(0, 8))
-        self._label(mark, "DE", color=TEXT_HI, size=15, weight="bold").pack(side="left")
-        ctk.CTkLabel(mark, text="LIGHTER", text_color=DIM, anchor="w",
+        self._label(mark, "BAKE&", color=TEXT_HI, size=15, weight="bold").pack(side="left")
+        ctk.CTkLabel(mark, text="DELIGHT", text_color=DIM, anchor="w",
                      font=ctk.CTkFont(family=self._light_family(), size=15)).pack(side="left")
-        self.top_info = self._label(top, "scan → pbr  //  de-light  //  compare", color=HINT, size=12)
+        self.top_info = self._label(top, "import → remesh → uv → bake → delight → export", color=HINT, size=12)
         self.top_info.grid(row=0, column=1, sticky="w")
         self.engine_label = self._label(top, "engine: --", color=DIM, size=12)
         self.engine_label.grid(row=0, column=2, padx=12)
@@ -473,8 +479,8 @@ class DelighterGUI(TuiWidgets):
         side.grid_columnconfigure(0, weight=1)
         side.grid_rowconfigure(1, weight=1)
 
-        self.tab_var = tk.StringVar(value="INPUT")
-        tabs = ["INPUT", "DELIGHT", "SCAN", "VIEW", "SYS"]
+        self.tab_var = tk.StringVar(value=TABS["import"])
+        tabs = list(TABS.values())
         self._segmented(side, self.tab_var, tabs, command=lambda _value: self._show_tab()).grid(
             row=0, column=0, sticky="ew", padx=8, pady=8)
 
@@ -486,22 +492,25 @@ class DelighterGUI(TuiWidgets):
             tab.next_row = 0
             tab.grid(row=1, column=0, sticky="nsew", padx=2)
             self.tabs[name] = tab
-        self._build_input_tab(self.tabs["INPUT"])
-        self._build_delight_tab(self.tabs["DELIGHT"])
-        self._build_scan_tab(self.tabs["SCAN"])
-        self._build_view_tab(self.tabs["VIEW"])
-        self._build_sys_tab(self.tabs["SYS"])
+        for key, build in (("import", self._build_input_tab), ("remesh", self._build_remesh_tab), ("uv", self._build_uv_tab),
+                           ("bake", self._build_bake_tab), ("delight", self._build_delight_tab),
+                           ("export", self._build_export_tab), ("view", self._build_view_tab), ("sys", self._build_sys_tab)):
+            build(self.tabs[TABS[key]])
         self._show_tab()
 
         actions = ctk.CTkFrame(side, fg_color="transparent")
         actions.grid(row=2, column=0, sticky="ew", padx=8, pady=8)
         actions.grid_columnconfigure((0, 1), weight=1, uniform="actions")
-        self.process_btn = self._button(actions, "run de-light  F5", self._start_processing, primary=True, state="disabled")
-        self.process_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.scan_btn = self._button(actions, "run scanopt  F6", self._start_scan, primary=True)
-        self.scan_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.stage_btn = self._button(actions, "run stage  F5", self._run_current_stage, primary=True)
+        self.stage_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.all_btn = self._button(actions, "run all  F6", lambda: self._start_scan("all"), primary=True)
+        self.all_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self.progress_label = self._label(actions, "", color=DIM, size=11)
         self.progress_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+    def _goto_tab(self, name):
+        self.tab_var.set(name)
+        self._show_tab()
 
     def _show_tab(self):
         for name, tab in self.tabs.items():
@@ -509,6 +518,18 @@ class DelighterGUI(TuiWidgets):
                 tab.grid()
             else:
                 tab.grid_remove()
+        self._refresh_run_buttons()
+
+    def _refresh_run_buttons(self):
+        """The left button runs the current tab's stage; the right one the whole pipeline."""
+        if not hasattr(self, "all_btn"):
+            return
+        busy = any(self._busy.values())
+        stage = STAGE_OF_TAB.get(self.tab_var.get())
+        label = f"[ RUN {stage.upper()}  F5 ]" if stage else "[ RUN STAGE  F5 ]"
+        self.stage_btn.configure(state="normal" if stage and not busy else "disabled",
+                                 text="[ RUNNING… ]" if busy else label)
+        self.all_btn.configure(state="disabled" if busy else "normal", text="[ RUN ALL  F6 ]")
 
     # ---------------------------------------------------------------- tabs
 
@@ -525,18 +546,28 @@ class DelighterGUI(TuiWidgets):
                 self._button(frame, text, command).grid(row=0, column=column, padx=(0, 4))
             return frame
         self._row(tab, "", project_buttons, hint=f"{PROJECT_SUFFIX}: inputs, settings, results")
-        self._section(tab, "model")
-        self._path_row(tab, "OBJ", "model", filetypes=[("OBJ mesh", "*.obj")], on_change=self._on_input_changed)
+        self._section(tab, "scan")
+        self._path_row(tab, "HIGH-RES SCAN", "scan", filetypes=[("Meshes", "*.obj *.ply *.fbx *.glb *.gltf *.stl")],
+                       on_change=self._on_scan_chosen)
+        self._path_row(tab, "PHOTO TEXTURE", "photo", filetypes=[("Images", "*.png *.jpg *.jpeg *.tif *.tiff *.exr")])
+        self._label(tab, "│   empty = taken from the scan's material", color=HINT, size=11).grid(
+            row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
+        tab.next_row += 1
+        self._section(tab, "low-res mesh")
+        self._path_row(tab, "OBJ", "model", filetypes=[("OBJ mesh", "*.obj")], on_change=self._on_input_changed,
+                       extra=[("remesh", lambda: self._goto_tab(TABS["remesh"]))])
         self._section(tab, "maps")
         self._path_row(tab, "LIT RGB", "lit", filetypes=images, on_change=self._on_input_changed)
         self._path_row(tab, "NORMAL (OS)", "normal", filetypes=images)
         self._path_row(tab, "AO", "ao", filetypes=images)
         self._path_row(tab, "MASK", "mask", filetypes=images)
-        self._row(tab, "", lambda parent: self._button(parent, "auto-fill from lit folder",
-                                                       lambda: self._auto_fill_other_maps(self.var["lit"].get(), force=True)))
-        self._section(tab, "output")
-        self._path_row(tab, "DIRECTORY", "output_dir", kind="dir")
-        self._row(tab, "FILENAME", lambda parent: self._entry(parent, self.var["output_name"]))
+        def map_buttons(parent):
+            frame = ctk.CTkFrame(parent, fg_color="transparent")
+            self._button(frame, "auto-fill from lit folder",
+                         lambda: self._auto_fill_other_maps(self.var["lit"].get(), force=True)).grid(row=0, column=0, padx=(0, 4))
+            self._button(frame, "bake", lambda: self._goto_tab(TABS["bake"])).grid(row=0, column=1)
+            return frame
+        self._row(tab, "", map_buttons, hint="no normal / AO yet? bake them from the scan")
         self._section(tab, "preview texture")
 
         def radios(parent):
@@ -554,6 +585,54 @@ class DelighterGUI(TuiWidgets):
         self._row(tab, "SINGLE VIEW", radios, hint="Space toggles · used by the Single view mode")
         self._row(tab, "", lambda parent: self._button(parent, "2d compare", self._open_preview_window))
 
+    def _build_remesh_tab(self, tab):
+        self._section(tab, "remesh")
+        self._row(tab, "REMESHER", lambda parent: self._option(parent, self.var["remesher"], list(REMESHERS), width=250))
+        self._row(tab, "TARGET FACES", lambda parent: self._entry(parent, self.var["faces"], width=90))
+        self._row(tab, "FEATURES", lambda parent: self._check(parent, "keep sharp edges (quads)", self.var["sharp"]))
+        self._slider_row(tab, "PRE-DECIMATE", "predecimate", 0, 8, 16, fmt="×{:.1f}")
+        self._label(tab, "│   quads: scan reduced to × target faces before remeshing · 0 = off", color=HINT, size=11).grid(
+            row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
+        tab.next_row += 1
+
+    def _build_uv_tab(self, tab):
+        self._section(tab, "uv")
+        self._row(tab, "UNWRAPPER", lambda parent: self._segmented(parent, self.var["unwrap"], ["xatlas", "smart"]))
+        self._slider_row(tab, "SMART ANGLE", "smart_angle", 30, 89, 59, fmt="{:.0f}°")
+        self._row(tab, "MARGIN PX", lambda parent: self._entry(parent, self.var["margin"], width=90))
+        self._label(tab, "│   charts are packed for the texture size set in 4 BAKE", color=HINT, size=11).grid(
+            row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
+        tab.next_row += 1
+
+    def _build_bake_tab(self, tab):
+        self._section(tab, "bake")
+        self._row(tab, "BACKEND", lambda parent: self._segmented(parent, self.var["backend"], ["auto", "blender", "native"]))
+        self._label(tab, "│   native: Embree + xatlas in Python, no Blender needed", color=HINT, size=11).grid(
+            row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
+        tab.next_row += 1
+        self._row(tab, "TEXTURE SIZE", lambda parent: self._segmented(parent, self.var["resolution"], ["512", "1024", "2048", "4096"]))
+        self._row(tab, "AO SAMPLES", lambda parent: self._entry(parent, self.var["ao_samples"], width=90))
+        self._slider_row(tab, "CAGE", "cage", 0.001, 0.05, 49, fmt="{:.3f}")
+        self._slider_row(tab, "MAX RAY", "max_ray", 0.005, 0.15, 29, fmt="{:.3f}")
+        self._label(tab, "│   cage / ray: fraction of the scan's bounding diagonal", color=HINT, size=11).grid(
+            row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
+        tab.next_row += 1
+
+    def _build_export_tab(self, tab):
+        self._section(tab, "output")
+        self._path_row(tab, "FOLDER", "scan_out", kind="dir")
+        self._label(tab, "│   empty = <scan>_optimized next to the scan", color=HINT, size=11).grid(
+            row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
+        tab.next_row += 1
+        self._row(tab, "FILES", lambda parent: self._label(parent, "glb (glTF PBR) · obj + mtl (quads) · texture PNGs",
+                                                             color=TEXT, size=12))
+        self._section(tab, "material")
+        self._slider_row(tab, "ROUGHNESS", "roughness", 0.2, 1.0, 80)
+        self._slider_row(tab, "VARIATION", "roughness_variation", 0.0, 0.6, 60)
+        self._section(tab, "work files")
+        self._row(tab, "RUN ALL", lambda parent: self._check(parent, "keep intermediate files", self.var["keep_work"]),
+                  hint="single stages always keep <output>/work")
+
     def _build_delight_tab(self, tab):
         self._section(tab, "model")
         self._path_row(tab, "ONNX", "onnx_model", filetypes=[("ONNX model", "*.onnx")])
@@ -568,46 +647,13 @@ class DelighterGUI(TuiWidgets):
         self._row(tab, "TILE SIZE", lambda parent: self._option(parent, self.var["tile_size"], ["auto", "512", "1024", "2048", "4096"]),
                   hint="auto = half the image")
         self._slider_row(tab, "OVERLAP", "tile_overlap", 0.05, 0.5, 45, fmt="{:.0%}")
-        self._section(tab, "output")
+        self._row(tab, "SCAN ROUTE", lambda parent: self._check(parent, "tiled inference", self.var["scan_tiled"]))
+        self._section(tab, "output (maps only)")
+        self._path_row(tab, "DIRECTORY", "output_dir", kind="dir")
+        self._row(tab, "FILENAME", lambda parent: self._entry(parent, self.var["output_name"]))
         self._row(tab, "BIT DEPTH", lambda parent: self._segmented(parent, self.var["bit_depth"], ["8", "16"]))
         self._row(tab, "MASK", lambda parent: self._check(parent, "black outside UV islands", self.var["apply_mask"]))
         self._row(tab, "AFTER RUN", lambda parent: self._check(parent, "switch preview to after", self.var["show_after_run"]))
-
-    def _build_scan_tab(self, tab):
-        self._section(tab, "source")
-        self._path_row(tab, "HIGH-RES SCAN", "scan", filetypes=[("Meshes", "*.obj *.ply *.fbx *.glb *.gltf *.stl")],
-                       on_change=self._on_scan_chosen)
-        self._path_row(tab, "PHOTO TEXTURE", "photo", filetypes=[("Images", "*.png *.jpg *.jpeg *.tif *.tiff *.exr")])
-        self._label(tab, "│   empty = taken from the scan's material", color=HINT, size=11).grid(
-            row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
-        tab.next_row += 1
-        self._path_row(tab, "OUTPUT FOLDER", "scan_out", kind="dir")
-        self._section(tab, "remesh")
-        self._row(tab, "REMESHER", lambda parent: self._option(parent, self.var["remesher"], list(REMESHERS), width=250))
-        self._row(tab, "TARGET FACES", lambda parent: self._entry(parent, self.var["faces"], width=90))
-        self._row(tab, "FEATURES", lambda parent: self._check(parent, "keep sharp edges (quads)", self.var["sharp"]))
-        self._section(tab, "uv")
-        self._row(tab, "UNWRAPPER", lambda parent: self._segmented(parent, self.var["unwrap"], ["xatlas", "smart"]))
-        self._slider_row(tab, "SMART ANGLE", "smart_angle", 30, 89, 59, fmt="{:.0f}°")
-        self._row(tab, "MARGIN PX", lambda parent: self._entry(parent, self.var["margin"], width=90))
-        self._section(tab, "bake")
-        self._row(tab, "BACKEND", lambda parent: self._segmented(parent, self.var["backend"], ["auto", "blender", "native"]))
-        self._label(tab, "│   native: Embree + xatlas in Python, no Blender needed", color=HINT, size=11).grid(
-            row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
-        tab.next_row += 1
-        self._row(tab, "TEXTURE SIZE", lambda parent: self._segmented(parent, self.var["resolution"], ["512", "1024", "2048", "4096"]))
-        self._row(tab, "AO SAMPLES", lambda parent: self._entry(parent, self.var["ao_samples"], width=90))
-        self._slider_row(tab, "CAGE", "cage", 0.001, 0.05, 49, fmt="{:.3f}")
-        self._slider_row(tab, "MAX RAY", "max_ray", 0.005, 0.15, 29, fmt="{:.3f}")
-        self._label(tab, "│   cage / ray: fraction of the scan's bounding diagonal", color=HINT, size=11).grid(
-            row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
-        tab.next_row += 1
-        self._section(tab, "material")
-        self._slider_row(tab, "ROUGHNESS", "roughness", 0.2, 1.0, 80)
-        self._slider_row(tab, "VARIATION", "roughness_variation", 0.0, 0.6, 60)
-        self._row(tab, "DE-LIGHT", lambda parent: self._check(parent, "tiled inference", self.var["scan_tiled"]))
-        self._section(tab, "debug")
-        self._row(tab, "WORK FILES", lambda parent: self._check(parent, "keep intermediate EXRs", self.var["keep_work"]))
 
     def _build_view_tab(self, tab):
         self._section(tab, "camera")
@@ -689,7 +735,7 @@ class DelighterGUI(TuiWidgets):
                 self.preview_texture.set("albedo" if self.preview_texture.get() == "lit" else "lit")
                 self._apply_view_mode()
 
-        bindings = {"<F5>": self._start_processing, "<F6>": self._start_scan, "1": lambda: set_mode(0),
+        bindings = {"<F5>": self._run_current_stage, "<F6>": lambda: self._start_scan("all"), "1": lambda: set_mode(0),
                     "2": lambda: set_mode(1), "3": lambda: set_mode(2), "<space>": flip_single,
                     "w": lambda: toggle("wireframe"), "c": lambda: toggle("checker"), "r": self._reset_view,
                     "a": lambda: toggle("autorotate"), "<Control-l>": self._clear_log}
@@ -721,7 +767,6 @@ class DelighterGUI(TuiWidgets):
         self._engine_load_id += 1
         load_id = self._engine_load_id
         self.engine = None
-        self.process_btn.configure(state="disabled")
         self._set_status("LOADING", WARN)
         self._append_log(f"engine: loading {model_name}")
 
@@ -739,7 +784,6 @@ class DelighterGUI(TuiWidgets):
         if load_id != self._engine_load_id:
             return
         self.engine = engine
-        self.process_btn.configure(state="normal")
         self.engine_label.configure(text=f"engine: {engine.provider_name} · {os.path.basename(model_name)}",
                                     text_color=ACCENT if engine.is_accelerated else WARN)
         self._set_status("READY", ACCENT)
@@ -748,7 +792,6 @@ class DelighterGUI(TuiWidgets):
     def _on_engine_error(self, error, load_id):
         if load_id != self._engine_load_id:
             return
-        self.process_btn.configure(state="disabled")
         self._set_status("ENGINE FAILED", ERROR)
         self._append_log(f"!! engine: {error}")
 
@@ -842,7 +885,7 @@ class DelighterGUI(TuiWidgets):
             return
         lit, norm, ao, mask = (self.var[key].get() for key in ("lit", "normal", "ao", "mask"))
         if not all([lit, norm, ao, mask]):
-            messagebox.showwarning("De-light", "All four input maps must be set (INPUT tab).", parent=self.root)
+            messagebox.showwarning("De-light", "All four input maps must be set (1 IMPORT tab).", parent=self.root)
             return
         try:
             self._validate_inputs([("Lit map", lit), ("Normal map", norm), ("AO map", ao), ("Mask", mask)])
@@ -861,7 +904,7 @@ class DelighterGUI(TuiWidgets):
                        apply_mask=self.var["apply_mask"].get())
 
         self._busy["delight"] = True
-        self.process_btn.configure(state="disabled", text="[ RUNNING… ]")
+        self._refresh_run_buttons()
         self._set_status("DE-LIGHTING", TEXT_HI)
         self._append_log(f"de-light → {output_path}  {options}")
 
@@ -882,7 +925,7 @@ class DelighterGUI(TuiWidgets):
 
     def _on_success(self, out_file, seconds):
         self._busy["delight"] = False
-        self.process_btn.configure(state="normal", text="[ RUN DE-LIGHT  F5 ]")
+        self._refresh_run_buttons()
         self.albedo_radio.configure(state="normal")
         self.last_output_path = out_file
         self._set_status("DONE", ACCENT)
@@ -893,7 +936,7 @@ class DelighterGUI(TuiWidgets):
 
     def _on_error(self, err_msg):
         self._busy["delight"] = False
-        self.process_btn.configure(state="normal", text="[ RUN DE-LIGHT  F5 ]")
+        self._refresh_run_buttons()
         self._set_status("FAILED", ERROR)
         self._append_log(f"!! {err_msg}")
         messagebox.showerror("De-light", f"Inference failed:\n{err_msg}", parent=self.root)
@@ -906,14 +949,27 @@ class DelighterGUI(TuiWidgets):
         candidate = os.path.join(APP_DIR, "training", ".venv", "Scripts", "python.exe")
         return chosen or os.environ.get("SCANOPT_PYTHON") or (candidate if os.path.isfile(candidate) else sys.executable)
 
-    def _start_scan(self):
-        if self._busy["scan"]:
+    def _scan_out(self):
+        scan = self.var["scan"].get().strip()
+        return self.var["scan_out"].get().strip() or os.path.join(os.path.dirname(scan), os.path.splitext(os.path.basename(scan))[0] + "_optimized")
+
+    def _run_current_stage(self):
+        stage = STAGE_OF_TAB.get(self.tab_var.get())
+        if stage is None or any(self._busy.values()):
+            return
+        scan_ready = os.path.isfile(self.var["scan"].get().strip()) and os.path.isfile(os.path.join(self._scan_out(), "work", "lit.png"))
+        if stage == "delight" and not scan_ready:
+            self._start_processing()  # no baked scan: de-light the maps set in 1 IMPORT
+        else:
+            self._start_scan(stage)
+
+    def _start_scan(self, stage="all"):
+        if any(self._busy.values()):
             return
         scan = self.var["scan"].get().strip()
         if not os.path.isfile(scan):
-            self.tab_var.set("SCAN")
-            self._show_tab()
-            messagebox.showwarning("Scan optimiser", "Choose a high-res scan file (SCAN tab).", parent=self.root)
+            self._goto_tab(TABS["import"])
+            messagebox.showwarning("Scan optimiser", "Choose a high-res scan file (1 IMPORT tab).", parent=self.root)
             return
         try:
             faces = int(self.var["faces"].get())
@@ -921,7 +977,7 @@ class DelighterGUI(TuiWidgets):
         except ValueError:
             messagebox.showwarning("Scan optimiser", "Faces, margin and AO samples must be whole numbers.", parent=self.root)
             return
-        out = self.var["scan_out"].get().strip() or os.path.join(os.path.dirname(scan), os.path.splitext(os.path.basename(scan))[0] + "_optimized")
+        out = self._scan_out()
         photo = self.var["photo"].get().strip()
         remesher = self.var["remesher"].get()
         command = [self._scanopt_python(), "-u", SCANOPT_SCRIPT, scan, "--out", out, "--faces", str(faces),
@@ -932,8 +988,9 @@ class DelighterGUI(TuiWidgets):
                    "--cage", f"{self._value('cage', float):.4f}", "--max-ray", f"{self._value('max_ray', float):.4f}",
                    "--roughness", f"{self._value('roughness', float):.3f}",
                    "--roughness-variation", f"{self._value('roughness_variation', float):.3f}",
+                   "--predecimate", f"{self._value('predecimate', float):.1f}",
                    "--blender", self.var["blender"].get(), "--quadwild", self.var["quadwild_dir"].get(),
-                   "--autoremesher", self.var["autoremesher_dir"].get()]
+                   "--autoremesher", self.var["autoremesher_dir"].get(), "--stage", stage]
         model = self.var["onnx_model"].get().strip()
         if model:
             command += ["--model", model]
@@ -944,12 +1001,12 @@ class DelighterGUI(TuiWidgets):
                 command.append(flag)
         env = dict(os.environ, XATLAS_SITE=self.var["xatlas_site"].get())
         self._busy["scan"] = True
-        self.scan_btn.configure(state="disabled", text="[ RUNNING… ]")
-        self._set_status("SCANOPT", TEXT_HI)
-        self._append_log(f"scanopt: {os.path.basename(scan)} → {faces} faces ({REMESHERS[remesher]}, {self.var['unwrap'].get()})")
-        threading.Thread(target=self._run_scan_optimizer, args=(command, env, (scan, photo or None)), daemon=True).start()
+        self._refresh_run_buttons()
+        self._set_status(stage.upper(), TEXT_HI)
+        self._append_log(f"{stage}: {os.path.basename(scan)} → {faces} faces ({REMESHERS[remesher]}, {self.var['unwrap'].get()})")
+        threading.Thread(target=self._run_scan_optimizer, args=(command, env, (scan, photo or None), stage, out), daemon=True).start()
 
-    def _run_scan_optimizer(self, command, env, source):
+    def _run_scan_optimizer(self, command, env, source, stage="all", out=""):
         glb_path, tail, started = None, [], time.time()
         try:
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
@@ -957,7 +1014,7 @@ class DelighterGUI(TuiWidgets):
             for line in process.stdout:
                 line = line.rstrip()
                 tail = (tail + [line])[-12:]
-                if line.startswith("[") and "/4]" in line[:6]:
+                if line.startswith("[") and "/5]" in line[:6]:
                     self._post(lambda text=line: (self._append_log(f"  {text}"),
                                                           self.progress_label.configure(text=f"scanopt {text[:5]}")))
                 elif line.startswith("done: "):
@@ -968,9 +1025,13 @@ class DelighterGUI(TuiWidgets):
 
         def finish():
             self._busy["scan"] = False
-            self.scan_btn.configure(state="normal", text="[ RUN SCANOPT  F6 ]")
+            self._refresh_run_buttons()
             self.progress_label.configure(text="")
-            if code == 0 and glb_path:
+            if code == 0 and stage not in ("all", "export"):
+                self._set_status("DONE", ACCENT)
+                self._append_log(f"{stage} done in {time.time() - started:.0f} s")
+                self._show_stage_result(stage, os.path.join(out, "work"))
+            elif code == 0 and glb_path:
                 self._set_status("DONE", ACCENT)
                 self._append_log(f"scanopt done in {time.time() - started:.0f} s: {glb_path}")
                 stem = os.path.splitext(glb_path)[0]
@@ -983,6 +1044,27 @@ class DelighterGUI(TuiWidgets):
                 self._append_log("!! scanopt failed:\n" + "\n".join(tail[-6:]))
 
         self._post(finish)
+
+    def _show_stage_result(self, stage, work):
+        """Preview what a single stage produced: the low mesh, its UV layout, the baked maps, the albedo."""
+        path = lambda name: os.path.join(work, name)
+        self.var["checker"].set(stage == "uv")
+        self.var["wireframe"].set(stage in ("remesh", "uv"))
+        if stage == "remesh":
+            self.var["model"].set(path("low_preview.obj"))
+        elif stage == "uv":
+            self.var["model"].set(path("low_uv.obj"))
+        elif stage == "bake":
+            self.var["model"].set(path("low_uv.obj"))
+            for key, name in (("lit", "lit.png"), ("normal", "normal_os.png"), ("ao", "ao.png"), ("mask", "mask.png")):
+                self.var[key].set(path(name))
+            self.preview_texture.set("lit")
+        elif stage == "delight":
+            self.last_output_path = path("albedo_raw.png")
+            self.albedo_radio.configure(state="normal")
+            self.preview_texture.set("albedo")
+        self._scan_before = None
+        self._refresh_viewport()
 
     def _show_optimized_scan(self, glb_path, scan=None, photo=None):
         """Load the optimised OBJ into the 3D preview: the baked photo as before, the

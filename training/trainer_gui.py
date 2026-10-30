@@ -101,7 +101,7 @@ class TrainerGUI(TuiWidgets):
         ctk.set_appearance_mode("dark")
         self.settings = self._load_settings()
         self.root = ctk.CTk(fg_color=BG)
-        self.root.title("delighter trainer")
+        self.root.title("BAKE&DELIGHT trainer")
         self.root.geometry("1500x920")
         self.root.minsize(1150, 720)
         self.font_family = self._pick_font()
@@ -211,8 +211,8 @@ class TrainerGUI(TuiWidgets):
         bar.grid_columnconfigure(3, weight=1)
         self._logo = ctk.CTkImage(self._logo_image(64), size=(26, 26))
         ctk.CTkLabel(bar, image=self._logo, text="").grid(row=0, column=0, padx=(14, 8), pady=9)
-        self._label(bar, "DE", color=TEXT_HI, size=17, weight="bold").grid(row=0, column=1, sticky="w")
-        ctk.CTkLabel(bar, text="LIGHTER · TRAINER", text_color=DIM, anchor="w",
+        self._label(bar, "BAKE&", color=TEXT_HI, size=17, weight="bold").grid(row=0, column=1, sticky="w")
+        ctk.CTkLabel(bar, text="DELIGHT · TRAINER", text_color=DIM, anchor="w",
                      font=ctk.CTkFont(family=self._light_family(), size=17)).grid(row=0, column=2, sticky="w")
         self.run_label = self._label(bar, "", color=DIM)
         self.run_label.grid(row=0, column=3, sticky="e", padx=10)

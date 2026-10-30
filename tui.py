@@ -42,10 +42,30 @@ class TuiWidgets:
         return image.resize((size, size), Image.Resampling.LANCZOS)
 
     def _set_icon(self):
+        import os
+        import sys
+        import tempfile
         from PIL import ImageTk
         self._icon = ImageTk.PhotoImage(self._logo_image(64), master=self.root)
-        # CustomTkinter installs its own icon shortly after start; set ours after it.
-        self.root.after(300, lambda: self.root.iconphoto(True, self._icon))
+        # On Windows the title bar and taskbar use the .ico, and CustomTkinter sets its own blue one
+        # about 200 ms after start; write ours and set it after that.
+        ico = None
+        if sys.platform == "win32":
+            ico = os.path.join(tempfile.gettempdir(), "bake_delight.ico")
+            try:
+                self._logo_image(256).save(ico, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)])
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("BakeDelight")  # own taskbar icon, not python's
+            except (OSError, AttributeError):
+                ico = None
+
+        def apply():
+            if ico:
+                self.root.iconbitmap(ico)  # also tells CustomTkinter not to set its own
+                self.root.iconbitmap(default=ico)  # dialogs and other toplevels
+            self.root.iconphoto(True, self._icon)
+        apply()
+        self.root.after(300, apply)
 
     def _pick_font(self):
         families = set(tkfont.families(self.root))

@@ -30,54 +30,43 @@ class OBJMesh:
 
     def __init__(self, path):
         self.path = path
-        positions = []
-        texcoords = []
-        position_indices = []
-        uv_indices = []
-
-        # OBJ is a text format, but decoding every line to Unicode is
-        # unnecessary for its numeric data. Keeping the parser byte-based
-        # also avoids building expanded Python vertex tuples for every face.
+        # Each record type is collected as raw bytes and converted with numpy in one pass;
+        # a per-line Python parser needs minutes for a multi-million-face scan.
+        v, vt, f = [], [], []
         with open(path, "rb") as handle:
-            for raw_line in handle:
-                parts = raw_line.split()
-                if not parts or parts[0].startswith(b"#"):
-                    continue
-                if parts[0] == b"v" and len(parts) >= 4:
-                    positions.append((float(parts[1]), float(parts[2]), float(parts[3])))
-                elif parts[0] == b"vt" and len(parts) >= 3:
-                    texcoords.append((float(parts[1]), float(parts[2])))
-                elif parts[0] == b"f" and len(parts) >= 4:
-                    face = []
-                    for token in parts[1:]:
-                        fields = token.split(b"/")
-                        if len(fields) < 2 or not fields[0] or not fields[1]:
-                            raise ValueError("The OBJ must provide UV coordinates for every face.")
-
-                        position_index = int(fields[0])
-                        uv_index = int(fields[1])
-                        position_index = position_index - 1 if position_index > 0 else len(positions) + position_index
-                        uv_index = uv_index - 1 if uv_index > 0 else len(texcoords) + uv_index
-                        if not (0 <= position_index < len(positions) and 0 <= uv_index < len(texcoords)):
-                            raise ValueError("The OBJ contains an out-of-range vertex or UV index.")
-                        face.append((position_index, uv_index))
-
-                    # Triangulate polygons as a fan, storing only indices until
-                    # all source vertices have been parsed.
-                    for index in range(1, len(face) - 1):
-                        for position_index, uv_index in (face[0], face[index], face[index + 1]):
-                            position_indices.append(position_index)
-                            uv_indices.append(uv_index)
-
-        if not position_indices:
+            for line in handle:
+                if line[:2] == b"v ":
+                    v.append(line[2:])
+                elif line[:3] == b"vt ":
+                    vt.append(line[3:])
+                elif line[:2] == b"f ":
+                    f.append(line[2:])
+        if not f:
             raise ValueError("The OBJ does not contain any faces.")
-        if len(uv_indices) != len(position_indices):
-            raise ValueError("The OBJ does not contain usable UV coordinates.")
-
-        source_positions = np.asarray(positions, dtype=np.float32)
-        source_uvs = np.asarray(texcoords, dtype=np.float32)
-        points = source_positions[np.asarray(position_indices, dtype=np.int32)]
-        uvs = source_uvs[np.asarray(uv_indices, dtype=np.int32)]
+        if not vt:
+            raise ValueError("The OBJ must provide UV coordinates for every face.")
+        source_positions = self._numbers(v, 3)
+        source_uvs = self._numbers(vt, 2)
+        fields = f[0].split()[0].count(b"/") + 1
+        if fields < 2 or b"//" in f[0]:
+            raise ValueError("The OBJ must provide UV coordinates for every face.")
+        corners = np.array(b" ".join(f).replace(b"/", b" ").split(), dtype=np.int64)
+        if len(corners) == len(f) * 3 * fields:  # all triangles
+            corners = corners.reshape(-1, fields)
+        else:  # polygons: fan-triangulate line by line
+            triangles = []
+            for line in f:
+                polygon = np.array(line.replace(b"/", b" ").split(), dtype=np.int64).reshape(-1, fields)
+                for index in range(1, len(polygon) - 1):
+                    triangles += [polygon[0], polygon[index], polygon[index + 1]]
+            corners = np.array(triangles, dtype=np.int64)
+        position_indices = np.where(corners[:, 0] > 0, corners[:, 0] - 1, corners[:, 0] + len(source_positions))
+        uv_indices = np.where(corners[:, 1] > 0, corners[:, 1] - 1, corners[:, 1] + len(source_uvs))
+        if (position_indices.min() < 0 or position_indices.max() >= len(source_positions)
+                or uv_indices.min() < 0 or uv_indices.max() >= len(source_uvs)):
+            raise ValueError("The OBJ contains an out-of-range vertex or UV index.")
+        points = source_positions[position_indices]
+        uvs = source_uvs[uv_indices]
         center = (points.min(axis=0) + points.max(axis=0)) * 0.5
         radius = float(np.max(np.linalg.norm(points - center, axis=1)))
         if radius <= 1e-8:
@@ -85,6 +74,13 @@ class OBJMesh:
         points = (points - center) / radius
         self.vertex_data = np.concatenate((points, uvs), axis=1)
         self.vertex_count = len(position_indices)
+
+    @staticmethod
+    def _numbers(lines, columns):
+        values = np.array(b" ".join(lines).split(), dtype=np.float32)
+        if len(values) % len(lines):  # mixed record lengths (optional w, vertex colours)
+            return np.array([line.split()[:columns] for line in lines], dtype=np.float32)
+        return values.reshape(len(lines), -1)[:, :columns]
 
     @staticmethod
     def _parse_vertex(token, position_count, uv_count):
