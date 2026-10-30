@@ -126,9 +126,9 @@ class DelighterGUI(TuiWidgets):
         self.viewport = None           # main view: single, wipe, or the "after" side
         self.viewport_before = None    # left view in side-by-side mode, same camera
         self.viewport_error = None
-        self._scan_before = None       # (original scan OBJ, photo) once an optimised scan is shown
-        self._stage_view = None        # what a single stage's result compares: before / after slots and labels
-        self._uv_layout = None         # PIL image of the UV layout, shown beside the model after the UV stage
+        self._scan_before = None       # (high-res scan OBJ, photo) once loaded: the HIGH side of the comparison
+        self._uv_layout = None         # PIL image of the low mesh's UV layout, shown on the 3 UV tab
+        self._uv_layout_key = None     # (path, mtime) it was drawn from
         self.project = None            # the open .bad project, if any
         self._project_saved = None     # its settings and results as last saved, to detect changes
         self._save_job = None
@@ -149,8 +149,8 @@ class DelighterGUI(TuiWidgets):
         self._apply_view_settings()
         self._start_autorotate()
         self._load_engine_async()
-        self._show_model_only()
         self._refresh_viewport()
+        self._load_high()
 
     # ================================================================ threads
 
@@ -379,8 +379,7 @@ class DelighterGUI(TuiWidgets):
         self._append_log(f"{key}: reloaded {os.path.basename(path)}")
         if key == "scan":
             self._scan_before = None
-            if self._stage_view and self._stage_view["before"] == "scan":
-                self._load_scan_before(path, self.var["photo"].get().strip())
+            self._load_high()
         elif on_change and key != "lit":
             on_change(key)
             return
@@ -551,6 +550,9 @@ class DelighterGUI(TuiWidgets):
         # remapping a tab full of CustomTkinter widgets took 60-600 ms per switch.
         self.tabs[self.tab_var.get()]._parent_frame.tkraise()
         self._refresh_run_buttons()
+        if getattr(self, "viewport", None):  # the view follows the tab: UV layout on 3 UV, high | low elsewhere
+            self._apply_view_settings()
+            self._refresh_viewport()
 
     def _refresh_run_buttons(self):
         """The left button runs the current tab's stage; the right one the whole pipeline."""
@@ -856,11 +858,7 @@ class DelighterGUI(TuiWidgets):
         if key == "model" and value and not value.lower().endswith(".obj"):
             messagebox.showwarning("Model", "The 3D preview supports OBJ meshes only.", parent=self.root)
             return
-        self._scan_before, self._stage_view, self._uv_layout = None, None, None
         self._append_log(f"{key}: {os.path.basename(value) if value else 'unloaded'}")
-        if key == "lit" and value:
-            self.var["checker"].set(False)
-        self._show_model_only()
         if key == "lit":
             self._validate_resolution(self.var["lit"].get())
             self._auto_fill_other_maps(self.var["lit"].get())
@@ -870,9 +868,11 @@ class DelighterGUI(TuiWidgets):
         scan = self.var["scan"].get()
         if not scan:  # unloaded: drop views that show it
             self._append_log("scan: unloaded")
-            self._scan_before, self._stage_view, self._uv_layout = None, None, None
+            self._scan_before = None
             self._refresh_viewport()
             return
+        self._scan_before = None
+        self._load_high()
         if not self.var["scan_out"].get():
             self.var["scan_out"].set(os.path.join(os.path.dirname(scan), os.path.splitext(os.path.basename(scan))[0] + "_optimized"))
 
@@ -969,7 +969,6 @@ class DelighterGUI(TuiWidgets):
         self._refresh_run_buttons()
         self.albedo_radio.configure(state="normal")
         self.last_output_path = out_file
-        self._stage_view, self._uv_layout = None, None
         self._set_status("DONE", ACCENT)
         self._append_log(f"done in {seconds:.1f} s: {out_file}")
         if self.var["show_after_run"].get():
@@ -1088,54 +1087,30 @@ class DelighterGUI(TuiWidgets):
         self._post(finish)
 
     def _show_stage_result(self, stage, work):
-        """Preview what a single stage produced: the low mesh, its UV layout, the baked maps, the albedo."""
+        """Load what a single stage produced; the open tab decides how it is shown."""
         path = lambda name: os.path.join(work, name)
-        scan, photo = self.var["scan"].get().strip(), self.var["photo"].get().strip()
-        self.var["checker"].set(stage == "uv")
-        self.var["wireframe"].set(stage == "uv")
-        self._uv_layout = None
-        if stage == "remesh":  # high scan | low mesh
+        if stage == "remesh":
             self.var["model"].set(path("low_preview.obj"))
-            self._stage_view = {"before": "scan", "after": (path("low_preview.obj"), None, "flat"), "labels": ("HIGH", "LOW")}
-            mode = VIEW_MODES[2]
-        elif stage == "uv":  # UV layout | model with checker
+        elif stage == "uv":
             self.var["model"].set(path("low_uv.obj"))
-            self._uv_layout = self._render_uv_layout(path("low_uv.obj"))
-            self._stage_view = {"before": (None, None, None), "after": (path("low_uv.obj"), None, None),
-                                "labels": ("UV LAYOUT", "MODEL")}
-            mode = VIEW_MODES[1]
-        elif stage == "bake":  # high scan | low mesh with the baked photo
+        elif stage == "bake":
             self.var["model"].set(path("low_uv.obj"))
             for key, name in (("lit", "lit.png"), ("normal", "normal_os.png"), ("ao", "ao.png"), ("mask", "mask.png")):
                 self.var[key].set(path(name))
-            self._stage_view = {"before": "scan", "after": (path("low_uv.obj"), path("lit.png"), None), "labels": ("HIGH", "BAKED")}
-            mode = VIEW_MODES[2]
-        else:  # delight: baked photo | albedo
+        else:
             self.last_output_path = path("albedo_raw.png")
             self.albedo_radio.configure(state="normal")
-            self._stage_view = {"before": (path("low_uv.obj"), path("lit.png"), None),
-                                "after": (path("low_uv.obj"), path("albedo_raw.png"), None), "labels": ("LIT", "ALBEDO")}
-            mode = VIEW_MODES[2]
-        self.var["view_mode"].set(mode)
         self._refresh_viewport()
-        if self._stage_view["before"] == "scan" and (self._scan_before or (None,))[0] != scan:
-            self._scan_before = None
-            self._load_scan_before(scan, photo)
+        if not self._scan_before:
+            self._load_high()
 
-    def _show_model_only(self):
-        """A low-res mesh without a texture: its UV layout beside the model with the checker."""
-        model, lit = self.var["model"].get(), self.var["lit"].get()
-        if self._stage_view or not (model and os.path.isfile(model)) or (lit and os.path.isfile(lit)):
-            return
-        try:
-            self._uv_layout = self._render_uv_layout(model)
-        except Exception as error:  # no UVs: the model still shows, grey with wireframe
-            self._append_log(f"uv layout: {error}")
-            return
-        self._stage_view = {"before": (None, None, None), "after": (model, None, None), "labels": ("UV LAYOUT", "MODEL")}
-        self.var["checker"].set(True)
-        self.var["wireframe"].set(True)
-        self.var["view_mode"].set(VIEW_MODES[1])
+    def _load_high(self):
+        scan = self.var["scan"].get().strip()
+        if scan and os.path.isfile(scan) and (self._scan_before or (None,))[0] != scan:
+            self._load_scan_before(scan, self.var["photo"].get().strip())
+
+    def _tab(self):
+        return next((key for key, label in TABS.items() if label == self.tab_var.get()), "import")
 
     def _render_uv_layout(self, obj_path, size=1024):
         """The low mesh's UV charts on the unit square: filled triangles with light edges."""
@@ -1158,7 +1133,6 @@ class DelighterGUI(TuiWidgets):
         self.uv_panel.configure(image=self._uv_photo)
 
     def _show_optimized_scan(self, glb_path, scan=None, photo=None):
-        self._stage_view, self._uv_layout = None, None
         """Load the optimised OBJ into the 3D preview: the baked photo as before, the
         de-lighted albedo as after. The original scan replaces the before view once loaded."""
         stem = os.path.splitext(glb_path)[0]
@@ -1214,8 +1188,9 @@ class DelighterGUI(TuiWidgets):
             camera.checker_cells = int(self.var["checker_cells"].get())
         except (tk.TclError, ValueError):
             pass
-        camera.wireframe = bool(self.var["wireframe"].get())
-        camera.checker = bool(self.var["checker"].get())
+        uv_tab = self._tab() == "uv"  # the UV tab always shows the checker and the edges
+        camera.wireframe = bool(self.var["wireframe"].get()) or uv_tab
+        camera.checker = bool(self.var["checker"].get()) or uv_tab
         camera.texture_filter = self.var["texture_filter"].get()
         camera.background = BACKGROUNDS.get(self.var["background"].get(), BACKGROUNDS["Charcoal"])
         camera.changed()
@@ -1243,7 +1218,7 @@ class DelighterGUI(TuiWidgets):
     def _apply_view_mode(self):
         """Single: one view, before or after per the radio. Side by side: two views on one
         camera. A/B wipe: one view split by a draggable line, before on the left."""
-        mode = self.var["view_mode"].get()
+        mode = VIEW_MODES[1] if self._tab() == "uv" else self.var["view_mode"].get()  # UV: layout | model
         if mode not in VIEW_MODES:
             mode = VIEW_MODES[0]
         side_by_side = mode == VIEW_MODES[1]
@@ -1262,7 +1237,7 @@ class DelighterGUI(TuiWidgets):
         if side_by_side:
             self.views_frame.grid_columnconfigure(0, weight=1, uniform="views")
             self.views_frame.grid_columnconfigure(1, weight=1, uniform="views")
-            if self._uv_layout is not None:
+            if self._tab() == "uv" and self._uv_layout is not None:
                 self.viewport_before.grid_remove()
                 self.uv_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
                 self.root.after_idle(self._draw_uv_panel)  # also when the panel keeps its size
@@ -1278,21 +1253,42 @@ class DelighterGUI(TuiWidgets):
             self.viewport.set_mode("wipe" if mode == VIEW_MODES[2] else "a" if self.preview_texture.get() == "lit" else "b")
 
     def _comparison(self):
-        """(mesh, texture) for before and after. Before is the original scan once an optimised
-        scan is shown and it could be loaded, else the lit texture on the same mesh."""
-        if self._stage_view:
-            before = self._stage_view["before"]
-            if before == "scan":
-                before = (*self._scan_before, None) if self._scan_before else (None, None, None)
-            return before, self._stage_view["after"]
+        """(mesh, texture, shading) for the left and right slots. 3 UV: nothing left (the UV layout
+        panel takes its place) and the model right. Every other tab: the high-res scan with its photo
+        left, the low mesh right - grey with wireframe on 1 IMPORT and 2 REMESH, with the baked photo
+        on 4 BAKE, with the albedo (or the photo) from 5 DELIGHT on."""
+        model, lit = self.var["model"].get(), self.var["lit"].get()
+        tab = self._tab()
+        if tab == "uv":
+            return (None, None, None), (model, None, None)
+        before = (*self._scan_before, None) if self._scan_before else (None, None, None)
+        if tab in ("import", "remesh"):
+            texture = None
+        elif tab == "bake":
+            texture = lit
+        else:
+            texture = self.last_output_path if self.last_output_path and os.path.isfile(self.last_output_path) else lit
+        texture = texture if texture and os.path.isfile(texture) else None
+        return before, (model, texture, None if texture else "flat")
+
+    def _update_uv_layout(self):
         model = self.var["model"].get()
-        before = (*self._scan_before, None) if self._scan_before else (model, self.var["lit"].get(), None)
-        return before, (model, self.last_output_path, None)
+        key = (model, os.path.getmtime(model)) if model and os.path.isfile(model) else None
+        if key == self._uv_layout_key:
+            return
+        self._uv_layout_key, self._uv_layout = key, None
+        if key:
+            try:
+                self._uv_layout = self._render_uv_layout(model)
+            except Exception as error:
+                self._append_log(f"uv layout: {error}")
 
     def _refresh_viewport(self):
         if not self.viewport:
             return
         before, after = self._comparison()
+        if self._tab() == "uv":
+            self._update_uv_layout()
         try:
             for view in (self.viewport, self.viewport_before):
                 view.set_slot("a", *before)
@@ -1311,9 +1307,13 @@ class DelighterGUI(TuiWidgets):
             return f"│ {name:<6} {slot.triangles:>9,} tris  {mesh}\n│        {texture}"
 
         self.stats_label.configure(text=describe("BEFORE", slots["a"], before) + "\n" + describe("AFTER", slots["b"], after))
-        left, right = (self._stage_view or {}).get("labels", ("BEFORE", "AFTER"))
-        left_count = "" if left == "UV LAYOUT" and self._uv_layout is not None else f" · {slots['a'].triangles:,} tris"
-        self.caption_before.configure(text=f"◀ {left}{left_count}")
+        if self._tab() == "uv":
+            self.caption_before.configure(text="◀ UV LAYOUT")
+            self.caption_after.configure(text=f"MODEL · {slots['b'].triangles:,} tris ▶")
+            return
+        left = f"HIGH · {slots['a'].triangles:,} tris" if self._scan_before else "HIGH · no scan loaded"
+        self.caption_before.configure(text=f"◀ {left}")
+        right = "LOW"
         self.caption_after.configure(text=f"{right} · {slots['b'].triangles:,} tris ▶")
 
     # ================================================================ 2D compare
