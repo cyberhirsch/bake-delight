@@ -14,6 +14,7 @@ from tkinter import filedialog, messagebox
 from tkinterdnd2 import TkinterDnD, DND_FILES
 from PIL import Image
 
+from bakedelight import models
 from bakedelight.project import SUFFIX as PROJECT_SUFFIX, Project, ProjectError
 from engine import DelighterInferenceEngine
 from tui import (ACCENT, ACCENT_DIM, BG, BORDER, BORDER_HI, DIM, ERROR, FIELD, HINT, PANEL, TEXT, TEXT_HI,  # noqa: F401
@@ -26,14 +27,12 @@ except Exception:
     forget = lambda _path: None  # noqa: E731
 
 
-MODEL_FILENAME = "delighter_model_fp16.onnx"
-MODEL_LABEL = "FP16"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SCANOPT_SCRIPT = os.path.join(APP_DIR, "scanopt", "scanopt.py")
 SETTINGS_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "TextureDelighter", "settings.json")
 # Mirrors scanopt.REMESHERS; kept here so the GUI starts even if scanopt's dependencies are missing.
 REMESHERS = {
-    "Triangles - decimation (Blender QEM)": "decimate",
+    "Triangles - decimation (QEM)": "decimate",
     "Quads - AutoRemesher (MIT)": "autoremesher",
     "Quads - QuadWild + Bi-MDF (GPL)": "quadwild",
 }
@@ -52,11 +51,11 @@ DEFAULTS = {
     # input
     "model": "", "lit": "", "normal": "", "ao": "", "mask": "", "output_dir": "",
     # de-light
-    "onnx_model": "", "force_cpu": False, "tiled": True, "tile_size": "auto", "tile_overlap": 0.25,
+    "ai_model": models.DEFAULT, "force_cpu": False, "tiled": True, "tile_size": "auto", "tile_overlap": 0.25,
     "bit_depth": "8", "apply_mask": True, "output_name": "delighted_albedo.png", "show_after_run": True,
     # scan optimiser
     "scan": "", "photo": "", "scan_out": "", "source": "scan", "remesher": next(iter(REMESHERS)), "faces": "10000",
-    "resolution": "2048", "backend": "auto", "unwrap": "xatlas", "smart_angle": 66.0, "margin": "16", "ao_samples": "64",
+    "resolution": "2048", "margin": "16", "ao_samples": "64",
     "cage": 0.01, "max_ray": 0.03, "roughness": 0.8, "roughness_variation": 0.25,
     "predecimate": 2.0, "sharp": False, "scan_tiled": False, "keep_work": False,
     # view
@@ -64,16 +63,15 @@ DEFAULTS = {
     "texture_filter": "mipmap", "background": "Charcoal", "orbit_speed": 0.5, "zoom_step": 1.14,
     "autorotate": False, "autorotate_speed": 20.0,
     # system
-    "blender": r"C:\Program Files\Blender Foundation\Blender 4.5\blender.exe",
     "quadwild_dir": r"F:\DelighterData\tools\quadwild-bimdf", "autoremesher_dir": r"F:\DelighterData\tools\autoremesher",
-    "xatlas_site": r"F:\DelighterData\tools\blender-site", "scanopt_python": "", "ui_scale": 1.0, "log_lines": "2000",
+    "scanopt_python": "", "ui_scale": 1.0, "log_lines": "2000",
 }
 
 # GUI setting -> project setting. These go into .bad files; the rest is per machine (settings.json).
 PROJECT_KEYS = {
-    **{key: f"delight.{key}" for key in ("model", "lit", "normal", "ao", "mask", "output_dir", "output_name", "onnx_model",
+    **{key: f"delight.{key}" for key in ("model", "lit", "normal", "ao", "mask", "output_dir", "output_name", "ai_model",
                                          "force_cpu", "tiled", "tile_size", "tile_overlap", "bit_depth", "apply_mask")},
-    **{key: f"scan.{key}" for key in ("scan", "photo", "source", "remesher", "faces", "resolution", "backend", "unwrap", "smart_angle",
+    **{key: f"scan.{key}" for key in ("scan", "photo", "source", "remesher", "faces", "resolution",
                                       "margin", "ao_samples", "cage", "max_ray", "roughness", "roughness_variation",
                                       "predecimate", "sharp", "keep_work")},
     "scan_out": "scan.out", "scan_tiled": "scan.tiled",
@@ -111,6 +109,8 @@ class DelighterGUI(TuiWidgets):
         self.var = {}
         for key, default in DEFAULTS.items():
             value = self.settings.get(key, default)
+            if (key == "remesher" and value not in REMESHERS) or (key == "ai_model" and value not in models.names()):
+                value = default  # renamed option or a model no longer bundled
             if isinstance(default, bool):
                 self.var[key] = tk.BooleanVar(value=bool(value))
             elif isinstance(default, float):
@@ -583,7 +583,7 @@ class DelighterGUI(TuiWidgets):
         self._section(tab, "scan")
         self._row(tab, "SOURCE", lambda parent: self._segmented(parent, self.var["source"], ["scan", "pbr"]),
                   hint="scan: de-lit photo · pbr: maps kept as they are")
-        self._path_row(tab, "HIGH-RES SCAN", "scan", filetypes=[("Meshes", "*.obj *.ply *.fbx *.glb *.gltf *.stl")],
+        self._path_row(tab, "HIGH-RES SCAN", "scan", filetypes=[("Meshes", "*.obj *.ply *.glb *.gltf *.stl")],
                        on_change=self._on_scan_chosen)
         self._path_row(tab, "PHOTO TEXTURE", "photo", filetypes=[("Images", "*.png *.jpg *.jpeg *.tif *.tiff *.exr")])
         self._label(tab, "│   empty = taken from the material · pbr: base colour override", color=HINT, size=11).grid(
@@ -633,8 +633,7 @@ class DelighterGUI(TuiWidgets):
 
     def _build_uv_tab(self, tab):
         self._section(tab, "uv")
-        self._row(tab, "UNWRAPPER", lambda parent: self._segmented(parent, self.var["unwrap"], ["xatlas", "smart"]))
-        self._slider_row(tab, "SMART ANGLE", "smart_angle", 30, 89, 59, fmt="{:.0f}°")
+        self._row(tab, "UNWRAPPER", lambda parent: self._label(parent, "xatlas", color=TEXT, size=12))
         self._row(tab, "MARGIN PX", lambda parent: self._entry(parent, self.var["margin"], width=90))
         self._label(tab, "│   charts are packed for the texture size set in 4 BAKE", color=HINT, size=11).grid(
             row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
@@ -642,10 +641,6 @@ class DelighterGUI(TuiWidgets):
 
     def _build_bake_tab(self, tab):
         self._section(tab, "bake")
-        self._row(tab, "BACKEND", lambda parent: self._segmented(parent, self.var["backend"], ["auto", "blender", "native"]))
-        self._label(tab, "│   native: Embree + xatlas in Python, no Blender needed", color=HINT, size=11).grid(
-            row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
-        tab.next_row += 1
         self._row(tab, "TEXTURE SIZE", lambda parent: self._segmented(parent, self.var["resolution"], ["512", "1024", "2048", "4096"]))
         self._row(tab, "AO SAMPLES", lambda parent: self._entry(parent, self.var["ao_samples"], width=90))
         self._slider_row(tab, "CAGE", "cage", 0.001, 0.05, 49, fmt="{:.3f}")
@@ -671,10 +666,9 @@ class DelighterGUI(TuiWidgets):
 
     def _build_delight_tab(self, tab):
         self._section(tab, "model")
-        self._path_row(tab, "ONNX", "onnx_model", filetypes=[("ONNX model", "*.onnx")])
-        self._label(tab, "│   empty = newest trained model (overcast, pilot)", color=HINT, size=11).grid(
-            row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
-        tab.next_row += 1
+        self._row(tab, "AI MODEL", lambda parent: self._option(parent, self.var["ai_model"], models.names(),
+                                                               command=lambda _value: self._load_engine_async()),
+                  hint="trained for overcast light; bundled with the app")
         self._row(tab, "DEVICE", lambda parent: self._check(parent, "force CPU", self.var["force_cpu"]))
         self._row(tab, "", lambda parent: self._button(parent, "reload engine", self._load_engine_async))
         self._section(tab, "inference")
@@ -715,10 +709,8 @@ class DelighterGUI(TuiWidgets):
 
     def _build_sys_tab(self, tab):
         self._section(tab, "tools")
-        self._path_row(tab, "BLENDER", "blender", filetypes=[("blender.exe", "*.exe")])
         self._path_row(tab, "QUADWILD DIR", "quadwild_dir", kind="dir")
         self._path_row(tab, "AUTOREMESHER", "autoremesher_dir", kind="dir")
-        self._path_row(tab, "XATLAS SITE", "xatlas_site", kind="dir")
         self._path_row(tab, "SCANOPT PY", "scanopt_python", filetypes=[("python.exe", "*.exe")])
         self._label(tab, "│   empty = training/.venv, else this interpreter", color=HINT, size=11).grid(
             row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
@@ -785,17 +777,13 @@ class DelighterGUI(TuiWidgets):
 
     # ================================================================ engine
 
-    @staticmethod
-    def _resolve_model(preferred=""):
-        """The shipped weights were recalled; fall back to locally trained models (DELIGHTER_MODEL overrides)."""
-        candidates = [preferred, os.environ.get("DELIGHTER_MODEL", ""),
-                      os.path.join(APP_DIR, "weights", MODEL_FILENAME),
-                      r"F:\DelighterData\runs\overcast\delighter.onnx",
-                      r"F:\DelighterData\runs\pilot\delighter.onnx"]
-        return next((path for path in candidates if path and os.path.isfile(path)), os.path.join("weights", MODEL_FILENAME))
-
     def _load_engine_async(self):
-        model_name = self._resolve_model(self.var["onnx_model"].get().strip())
+        try:
+            model_name = str(models.resolve(self.var["ai_model"].get()))
+        except FileNotFoundError as error:
+            self._set_status("NO MODEL", ERROR)
+            self._append_log(f"!! engine: {error}")
+            return
         if self.var["force_cpu"].get():
             os.environ["DELIGHTER_FORCE_CPU"] = "1"
         else:
@@ -1025,28 +1013,23 @@ class DelighterGUI(TuiWidgets):
         remesher = self.var["remesher"].get()
         command = [self._scanopt_python(), "-u", SCANOPT_SCRIPT, scan, "--out", out, "--source", self.var["source"].get(), "--faces", str(faces),
                    "--remesher", REMESHERS[remesher], "--resolution", self.var["resolution"].get(),
-                   "--backend", self.var["backend"].get(),
-                   "--unwrap", self.var["unwrap"].get(), "--smart-angle", f"{self._value('smart_angle', float):.1f}",
                    "--margin", str(numbers["margin"]), "--ao-samples", str(numbers["ao_samples"]),
                    "--cage", f"{self._value('cage', float):.4f}", "--max-ray", f"{self._value('max_ray', float):.4f}",
                    "--roughness", f"{self._value('roughness', float):.3f}",
                    "--roughness-variation", f"{self._value('roughness_variation', float):.3f}",
                    "--predecimate", f"{self._value('predecimate', float):.1f}",
-                   "--blender", self.var["blender"].get(), "--quadwild", self.var["quadwild_dir"].get(),
-                   "--autoremesher", self.var["autoremesher_dir"].get(), "--stage", stage]
-        model = self.var["onnx_model"].get().strip()
-        if model:
-            command += ["--model", model]
+                   "--quadwild", self.var["quadwild_dir"].get(), "--autoremesher", self.var["autoremesher_dir"].get(),
+                   "--model", self.var["ai_model"].get(), "--stage", stage]
         if photo:
             command += ["--texture", photo]
         for key, flag in (("sharp", "--sharp"), ("scan_tiled", "--tiled"), ("keep_work", "--keep-work")):
             if self.var[key].get():
                 command.append(flag)
-        env = dict(os.environ, XATLAS_SITE=self.var["xatlas_site"].get())
+        env = dict(os.environ)
         self._busy["scan"] = True
         self._refresh_run_buttons()
         self._set_status(stage.upper(), TEXT_HI)
-        self._append_log(f"{stage}: {os.path.basename(scan)} → {faces} faces ({REMESHERS[remesher]}, {self.var['unwrap'].get()})")
+        self._append_log(f"{stage}: {os.path.basename(scan)} → {faces} faces ({REMESHERS[remesher]})")
         threading.Thread(target=self._run_scan_optimizer, args=(command, env, (scan, photo or None), stage, out), daemon=True).start()
 
     def _run_scan_optimizer(self, command, env, source, stage="all", out=""):

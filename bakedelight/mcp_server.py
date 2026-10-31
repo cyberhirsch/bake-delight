@@ -191,13 +191,13 @@ def list_jobs() -> list[dict]:
 
 @server.tool()
 def cancel_job(job_id: str) -> dict:
-    """Stop a running job and the tools it started (Blender, remeshers)."""
+    """Stop a running job and the tools it started (remeshers)."""
     job = JOBS.get(job_id)
     if job is None:
         raise ToolError(f"unknown job {job_id}")
     if job.state == "running":
         job.state = "cancelled"
-        if sys.platform == "win32":  # /T ends the whole tree: scanopt, Blender, quadwild.exe
+        if sys.platform == "win32":  # /T ends the whole tree: scanopt, quadwild.exe
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(job.process.pid)], capture_output=True)
         else:
             job.process.kill()

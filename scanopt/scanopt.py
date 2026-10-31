@@ -2,7 +2,7 @@
 
     python scanopt.py scan.obj --texture photo.jpg --out result/ --faces 10000 --remesher decimate
 
-Remeshers: decimate (triangles, Blender QEM), quadwild (QuadWild + Bi-MDF quads,
+Remeshers: decimate (triangles, QEM), quadwild (QuadWild + Bi-MDF quads,
 GPL-3.0 binary), autoremesher (AutoRemesher quads, MIT binary).
 
 Stages: the mesh is reduced and unwrapped and the photo, normals and AO are baked
@@ -10,14 +10,13 @@ from the high-res surface; the de-lighter turns the baked photo into albedo; a
 heuristic derives roughness; the glTF PBR asset is assembled and exported as
 <name>.glb plus <name>.obj and the individual texture PNGs.
 
-Backends (--backend): blender (Cycles bake, needs Blender) or native (trimesh,
-fast-simplification, xatlas and Embree in plain Python, no Blender). auto picks
-Blender when it is installed.
+Everything runs in plain Python (trimesh, fast-simplification, xatlas, Embree);
+the de-lighter is the bundled model chosen with --model (models/<name>.onnx).
 
 Sources (--source): scan (photo texture with the light in it, de-lit) or pbr (a
 high-res model with PBR materials, glTF or OBJ + MTL: base colour, roughness,
-metallic, normal and occlusion are baked as they are, without de-lighting; native
-backend only). --map-* replace the model's own maps.
+metallic, normal and occlusion are baked as they are, without de-lighting).
+--map-* replace the model's own maps.
 """
 
 from __future__ import annotations
@@ -26,7 +25,6 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -40,36 +38,19 @@ REPO = HERE.parent
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "training"))
 from postprocess import rasterise_mask, read_exr, to_srgb, write_png16  # noqa: E402
+from bakedelight import models  # noqa: E402
 
 sys.path.insert(0, str(HERE))
 import native_stage  # noqa: E402
 from native_stage import fill_gutter  # noqa: E402
 
 STAGES = ["remesh", "uv", "bake", "delight", "export"]
-DEFAULT_BLENDER = r"C:\Program Files\Blender Foundation\Blender 4.5\blender.exe"
 # Shown in the GUI dropdown, in this order. DJM (SIGGRAPH 2026) joins once its code is published.
 REMESHERS = {
-    "decimate": "Triangles - decimation (Blender QEM)",
+    "decimate": "Triangles - decimation (QEM)",
     "autoremesher": "Quads - AutoRemesher (MIT)",
     "quadwild": "Quads - QuadWild + Bi-MDF (GPL)",
 }
-MODEL_CANDIDATES = [
-    Path(r"F:\DelighterData\runs\overcast\delighter.onnx"),
-    Path(r"F:\DelighterData\runs\pilot\delighter.onnx"),
-    REPO / "weights" / "delighter_model_fp16.onnx",
-]
-
-
-def blender(executable: str, *arguments: str) -> None:
-    command = [executable, "-b", "--factory-startup", "--disable-autoexec"]
-    if arguments[0].endswith(".blend"):
-        command.append(arguments[0])
-        arguments = arguments[1:]
-    command += ["-P", str(HERE / "blender_stage.py"), "--", *arguments]
-    result = subprocess.run(command, capture_output=True, text=True, errors="replace")
-    if result.returncode != 0 or "Traceback" in result.stdout + result.stderr:
-        log = (result.stdout + result.stderr)[-3000:]
-        raise SystemExit(f"Blender stage failed:\n{log}")
 
 
 def roughness_map(normal_ts: np.ndarray, ao: np.ndarray, mask: np.ndarray, base: float, strength: float) -> np.ndarray:
@@ -93,7 +74,7 @@ def write_png8(path: Path, image: np.ndarray) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("input", type=Path, help="high-res scan: OBJ, PLY, FBX, GLB/glTF")
+    parser.add_argument("input", type=Path, help="high-res scan or model: OBJ, PLY, GLB/glTF, STL")
     parser.add_argument("--texture", type=Path, help="photo texture, or base colour for --source pbr (default: taken from the material)")
     parser.add_argument("--source", choices=["scan", "pbr"], default="scan",
                         help="scan: photo scan, de-lit; pbr: model with PBR materials, baked as they are")
@@ -107,19 +88,13 @@ def main() -> int:
     parser.add_argument("--resolution", type=int, default=2048, choices=[512, 1024, 2048, 4096])
     parser.add_argument("--roughness", type=float, default=0.8, help="base roughness")
     parser.add_argument("--roughness-variation", type=float, default=0.25)
-    parser.add_argument("--model", type=Path, help="de-lighter ONNX model (default: newest trained one)")
-    parser.add_argument("--backend", choices=["auto", "blender", "native"], default="auto",
-                        help="blender (Cycles bake) or native (Embree, no Blender); auto: Blender if installed")
-    parser.add_argument("--blender", default=os.environ.get("BLENDER", DEFAULT_BLENDER))
+    parser.add_argument("--model", default=models.DEFAULT, help=f"de-lighter model: {', '.join(models.names())}")
     parser.add_argument("--quadwild", type=Path, help="QuadWild-BiMDF folder (default: QUADWILD_DIR or F:/DelighterData/tools/quadwild-bimdf)")
     parser.add_argument("--autoremesher", type=Path, help="AutoRemesher folder (default: AUTOREMESHER_DIR or F:/DelighterData/tools/autoremesher)")
-    parser.add_argument("--unwrap", choices=["xatlas", "smart"], default="xatlas",
-                        help="UV unwrapper: xatlas (MIT, fewer and larger charts) or Blender Smart UV Project")
     parser.add_argument("--margin", type=int, default=16, help="texels of padding around each UV chart")
     parser.add_argument("--ao-samples", type=int, default=64)
     parser.add_argument("--cage", type=float, default=0.01, help="bake ray start offset, fraction of the bounds diagonal")
     parser.add_argument("--max-ray", type=float, default=0.03, help="bake ray search distance, fraction of the bounds diagonal")
-    parser.add_argument("--smart-angle", type=float, default=66.0, help="Smart UV Project angle limit, degrees")
     parser.add_argument("--tiled", action="store_true", help="de-light in overlapping tiles (less VRAM)")
     parser.add_argument("--predecimate", type=float, default=2.0,
                         help="quad mode: decimate the scan to this many times --faces before quad remeshing (0 = off)")
@@ -131,20 +106,12 @@ def main() -> int:
     if args.topology:
         args.remesher = "quadwild" if args.topology == "quad" else "decimate"
     quads = args.remesher != "decimate"
-    args.input, args.out = args.input.resolve(), args.out.resolve()  # Blender resolves relative paths elsewhere
+    args.input, args.out = args.input.resolve(), args.out.resolve()
     args.texture = args.texture.resolve() if args.texture else None
-    native = args.backend == "native" or (args.backend == "auto" and not Path(args.blender).is_file())
-    if args.source == "pbr" and not native:
-        print("the PBR bake runs on the native backend", flush=True)
-        native = True
-    if native and (missing := native_stage.available()):
-        raise SystemExit(f"The native backend needs: {missing}")
-    if not native and not Path(args.blender).is_file():
-        raise SystemExit(f"Blender not found at {args.blender}; pass --blender or use --backend native")
-    print(f"backend: {'native (Embree)' if native else 'Blender ' + args.blender}", flush=True)
-    if native and args.unwrap == "smart":
-        print("Smart UV Project is a Blender tool; the native backend unwraps with xatlas", flush=True)
-        args.unwrap = "xatlas"
+    if args.input.suffix.lower() == ".fbx":
+        raise SystemExit("FBX is not supported; export the mesh as OBJ, PLY or glTF")
+    if missing := native_stage.available():
+        raise SystemExit(f"Missing packages: {missing}")
 
     name = args.input.stem
     work = args.out / "work"
@@ -170,11 +137,7 @@ def main() -> int:
             if quads:
                 print(f"{tag} quad remeshing with {REMESHERS[args.remesher]} towards {args.faces} faces", flush=True)
                 target = round(args.predecimate * args.faces) if args.predecimate > 0 else 0
-                if native:
-                    remesh_faces = native_stage.export_high(args.input, work / "high.obj", target)
-                else:
-                    blender(args.blender, "export-high", "--input", str(args.input), "--obj", str(work / "high.obj"))
-                    remesh_faces = native_stage.predecimate(work / "high.obj", target) if target else None
+                remesh_faces = native_stage.export_high(args.input, work / "high.obj", target)
                 if target:
                     print(f"      pre-decimated to {remesh_faces} triangles for the remesher", flush=True)
                 if args.remesher == "quadwild":
@@ -196,29 +159,20 @@ def main() -> int:
 
         elif stage == "uv":
             need(work / "low.obj", "remesh")
-            print(f"{tag} unwrapping ({args.unwrap})", flush=True)
-            if native:
-                info = native_stage.layout(work / "low.obj", args.input, work, args.resolution, args.margin,
-                                           log=lambda text: print(text, flush=True))
-                print(f"      uv mesh: {work / 'low_uv.obj'}", flush=True)
-            else:  # Blender unwraps and bakes in one pass; the bake stage then reuses it
-                print("      Blender backend: unwrap and bake run together", flush=True)
-                run_blender_prep(args, work, quads)
-                info = json.loads((work / "prep.json").read_text())
-            done("uv", since, unwrap=args.unwrap, resolution=args.resolution, charts=info.get("charts"))
+            print(f"{tag} unwrapping (xatlas)", flush=True)
+            info = native_stage.layout(work / "low.obj", args.input, work, args.resolution, args.margin,
+                                       log=lambda text: print(text, flush=True))
+            print(f"      uv mesh: {work / 'low_uv.obj'}", flush=True)
+            done("uv", since, unwrap="xatlas", resolution=args.resolution, charts=info.get("charts"))
 
         elif stage == "bake":
-            print(f"{tag} baking high->low ({'Embree' if native else 'Cycles'})", flush=True)
-            if native:
-                need(work / "layout.npz", "uv")
-                maps = {"roughness": args.map_roughness, "metallic": args.map_metallic, "normal": args.map_normal,
-                        "occlusion": args.map_ao}
-                native_stage.bake_layout(args.input, args.texture, work, args.cage, args.max_ray, args.ao_samples,
-                                         topology="quad" if quads else "tri", log=lambda text: print(text, flush=True),
-                                         source=args.source, maps={k: v.resolve() for k, v in maps.items() if v})
-            elif not (work / "prep.json").is_file() or (work / "prep.json").stat().st_mtime < (work / "low.obj").stat().st_mtime:
-                need(work / "low.obj", "remesh")
-                run_blender_prep(args, work, quads)
+            print(f"{tag} baking high->low (Embree)", flush=True)
+            need(work / "layout.npz", "uv")
+            maps = {"roughness": args.map_roughness, "metallic": args.map_metallic, "normal": args.map_normal,
+                    "occlusion": args.map_ao}
+            native_stage.bake_layout(args.input, args.texture, work, args.cage, args.max_ray, args.ao_samples,
+                                     topology="quad" if quads else "tri", log=lambda text: print(text, flush=True),
+                                     source=args.source, maps={k: v.resolve() for k, v in maps.items() if v})
             write_delight_inputs(work, args.resolution)
             print(f"      maps: {work / 'lit.png'}", flush=True)
             done("bake", since)
@@ -230,9 +184,10 @@ def main() -> int:
                 write_png8(work / "albedo_raw.png", to_srgb(read_exr(work / "lit.exr")))
                 done("delight", since, model=None, device=None)
                 continue
-            model = args.model or next((p for p in MODEL_CANDIDATES if p.is_file()), None)
-            if model is None:
-                raise SystemExit("No de-lighter model found; pass --model")
+            try:
+                model = models.resolve(args.model)
+            except FileNotFoundError as error:
+                raise SystemExit(str(error)) from None
             print(f"{tag} de-lighting with {model}", flush=True)
             from engine import DelighterInferenceEngine  # the app's own inference path
             engine = DelighterInferenceEngine(str(model))
@@ -244,10 +199,10 @@ def main() -> int:
         elif stage == "export":
             need(work / "albedo_raw.png", "delight")
             print(f"{tag} roughness, gutter fill, assembling glTF PBR material", flush=True)
-            glb = export(args, work, name, native, quads)
+            glb = export(args, work, name)
             done("export", since, glb=str(glb))
             info = json.loads((work / "prep.json").read_text())
-            report = {"backend": "native" if native else "blender", **info, "remesher": args.remesher,
+            report = {**info, "remesher": args.remesher,
                       "stages": state, "glb": str(glb)}
             (args.out / f"{name}_report.json").write_text(json.dumps(report, indent=2, default=str))
             if args.stage == "all" and not args.keep_work:
@@ -256,16 +211,6 @@ def main() -> int:
     if args.stage != "all":
         print(f"stage {args.stage} done ({time.time() - started:.1f} s)", flush=True)
     return 0
-
-
-def run_blender_prep(args, work: Path, quads: bool) -> None:
-    prep = ["prep", "--input", str(args.input), "--out", str(work), "--topology", "quad" if quads else "tri",
-            "--faces", str(args.faces), "--resolution", str(args.resolution), "--unwrap", args.unwrap,
-            "--margin", str(args.margin), "--ao-samples", str(args.ao_samples), "--cage", str(args.cage),
-            "--max-ray", str(args.max_ray), "--smart-angle", str(args.smart_angle), "--low-mesh", str(work / "low.obj")]
-    if args.texture:
-        prep += ["--texture", str(args.texture)]
-    blender(args.blender, *prep)
 
 
 def baked_source(work: Path) -> str:
@@ -285,7 +230,7 @@ def write_delight_inputs(work: Path, resolution: int) -> None:
     cv2.imwrite(str(work / "mask.png"), mask)
 
 
-def export(args, work: Path, name: str, native: bool, quads: bool) -> Path:
+def export(args, work: Path, name: str) -> Path:
     mask = cv2.imread(str(work / "mask.png"), cv2.IMREAD_GRAYSCALE)
     lit, normal_ts = read_exr(work / "lit.exr"), read_exr(work / "normal_ts.exr")
     ao = read_exr(work / "ao.exr")[..., 0]
@@ -301,12 +246,7 @@ def export(args, work: Path, name: str, native: bool, quads: bool) -> Path:
     else:
         write_png8(work / "roughness.png", fill_gutter(roughness_map(normal_ts, ao, mask, args.roughness, args.roughness_variation)[..., None], mask)[..., 0])
     glb = args.out / f"{name}.glb"
-    if native:
-        native_stage.assemble(work, glb, name, metallic=pbr)  # the OBJ keeps quads; no FBX without Blender
-    else:
-        shutil.copy(work / "ao8.png", work / "ao.png")  # the Blender material reads ao.png
-        assemble = [str(work / "low.blend"), "assemble", "--out", str(work), "--export", str(glb)]
-        blender(args.blender, *assemble, *(["--keep-quads"] if quads else []))
+    native_stage.assemble(work, glb, name, metallic=pbr)  # the OBJ keeps quads
     textures = args.out / "textures"
     textures.mkdir(exist_ok=True)
     for source, target in [("albedo.png", "albedo"), ("normal.png", "normal_gl"), ("roughness.png", "roughness"),

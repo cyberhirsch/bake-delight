@@ -16,6 +16,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from bakedelight import models
 from bakedelight.project import Project, ProjectError
 
 REPO = Path(__file__).resolve().parent.parent
@@ -23,15 +24,10 @@ SCANOPT_SCRIPT = REPO / "scanopt" / "scanopt.py"
 # The GUI's settings file; the tool locations in it are shared with the CLI and the MCP server.
 SETTINGS_PATH = Path(os.environ.get("APPDATA", os.path.expanduser("~"))) / "TextureDelighter" / "settings.json"
 MACHINE_DEFAULTS = {
-    "blender": r"C:\Program Files\Blender Foundation\Blender 4.5\blender.exe",
     "quadwild_dir": r"F:\DelighterData\tools\quadwild-bimdf",
     "autoremesher_dir": r"F:\DelighterData\tools\autoremesher",
-    "xatlas_site": r"F:\DelighterData\tools\blender-site",
     "scanopt_python": "",
 }
-MODEL_CANDIDATES = [REPO / "weights" / "delighter_model_fp16.onnx",
-                    Path(r"F:\DelighterData\runs\overcast\delighter.onnx"),
-                    Path(r"F:\DelighterData\runs\pilot\delighter.onnx")]
 
 
 def machine_settings() -> dict:
@@ -43,13 +39,12 @@ def machine_settings() -> dict:
     return {key: stored.get(key) or default for key, default in MACHINE_DEFAULTS.items()}
 
 
-def resolve_model(preferred: str = "") -> Path:
-    """The shipped weights were recalled; fall back to locally trained models (DELIGHTER_MODEL overrides)."""
-    candidates = [preferred, os.environ.get("DELIGHTER_MODEL", ""), *MODEL_CANDIDATES]
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file():
-            return Path(candidate)
-    raise ProjectError("no de-lighter model found; set delight.onnx_model or DELIGHTER_MODEL")
+def resolve_model(name: str = "") -> Path:
+    """The bundled de-lighter model of that name (DELIGHTER_MODEL overrides)."""
+    try:
+        return models.resolve(name)
+    except FileNotFoundError as error:
+        raise ProjectError(str(error)) from None
 
 
 def scanopt_python(machine: dict) -> str:
@@ -69,7 +64,7 @@ def delight(project: Project, log=print) -> dict:
     if missing:
         raise ProjectError(f"missing input maps: {', '.join(missing)}")
     output = Path(s["output_dir"] or os.path.dirname(s["lit"])) / (s["output_name"] or "delighted_albedo.png")
-    model = resolve_model(s["onnx_model"])
+    model = resolve_model(s["ai_model"])
     if s["force_cpu"]:
         os.environ["DELIGHTER_FORCE_CPU"] = "1"
     sys.path.insert(0, str(REPO))
@@ -101,21 +96,17 @@ def scan_command(project: Project, machine: dict | None = None) -> tuple[list[st
     out = Path(s["out"]) if s["out"] else scan.with_name(scan.stem + "_optimized")
     command = [scanopt_python(machine), "-u", str(SCANOPT_SCRIPT), str(scan), "--out", str(out),
                "--source", s["source"], "--faces", str(s["faces"]), "--remesher", s["remesher"], "--resolution", str(s["resolution"]),
-               "--backend", s["backend"], "--unwrap", s["unwrap"], "--smart-angle", f"{s['smart_angle']:.1f}",
                "--margin", str(s["margin"]), "--ao-samples", str(s["ao_samples"]),
                "--cage", f"{s['cage']:.4f}", "--max-ray", f"{s['max_ray']:.4f}",
                "--roughness", f"{s['roughness']:.3f}", "--roughness-variation", f"{s['roughness_variation']:.3f}",
-               "--blender", machine["blender"], "--quadwild", machine["quadwild_dir"],
-               "--autoremesher", machine["autoremesher_dir"]]
-    model = project.settings["delight"]["onnx_model"]
-    if model:
-        command += ["--model", model]
+               "--quadwild", machine["quadwild_dir"], "--autoremesher", machine["autoremesher_dir"],
+               "--model", project.settings["delight"]["ai_model"]]
     if s["photo"]:
         command += ["--texture", s["photo"]]
     for key, flag in (("sharp", "--sharp"), ("tiled", "--tiled"), ("keep_work", "--keep-work")):
         if s[key]:
             command.append(flag)
-    env = dict(os.environ, XATLAS_SITE=machine["xatlas_site"], PYTHONUNBUFFERED="1")
+    env = dict(os.environ, PYTHONUNBUFFERED="1")
     return command, env, out
 
 
@@ -134,21 +125,20 @@ def scan(project: Project, log=print) -> dict:
                 log(line)
         code = process.wait()
     except BaseException:
-        process.kill()  # Ctrl+C or a cancelled job must not leave Blender or a remesher running
+        process.kill()  # Ctrl+C or a cancelled job must not leave a remesher running
         raise
     if code != 0 or not glb:
         raise RuntimeError("scanopt failed:\n" + "\n".join(tail[-12:]))
     glb = Path(glb)
     stem = glb.with_suffix("")
     result = {"glb": str(glb), "out": str(out), "textures": str(out / "textures")}
-    for suffix in (".obj", ".fbx"):
-        if stem.with_suffix(suffix).is_file():
-            result[suffix[1:]] = str(stem.with_suffix(suffix))
+    if stem.with_suffix(".obj").is_file():
+        result["obj"] = str(stem.with_suffix(".obj"))
     report = out / f"{glb.stem}_report.json"
     if report.is_file():
         result["report"] = str(report)
         data = json.loads(report.read_text(encoding="utf-8"))
-        result.update({key: data[key] for key in ("source_faces", "faces", "quads", "backend", "remesher") if key in data})
+        result.update({key: data[key] for key in ("source", "source_faces", "faces", "quads", "remesher") if key in data})
     result.update(_finished(started))
     project.results["scan"] = result
     return result

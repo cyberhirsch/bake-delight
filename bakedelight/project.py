@@ -14,7 +14,7 @@ A .bad file is UTF-8 JSON, so it diffs and merges like source:
 
 Paths are stored relative to the .bad file (forward slashes) when they sit on the same
 drive, absolute otherwise, so a project folder can be moved or shared as a whole. In
-memory every path is absolute. Machine-specific settings (Blender, remesher folders, UI)
+memory every path is absolute. Machine-specific settings (remesher folders, UI)
 stay in the GUI's settings.json and never go into a project.
 """
 
@@ -26,6 +26,8 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from bakedelight import models
+
 FORMAT = "bake-delight"
 VERSION = 1
 SUFFIX = ".bad"
@@ -35,28 +37,27 @@ SCHEMA = {
     "delight": {
         "model": "", "lit": "", "normal": "", "ao": "", "mask": "",
         "output_dir": "", "output_name": "delighted_albedo.png",
-        "onnx_model": "", "force_cpu": False,
+        "ai_model": models.DEFAULT, "force_cpu": False,
         "tiled": True, "tile_size": 0, "tile_overlap": 0.25, "bit_depth": 8, "apply_mask": True,
     },
     "scan": {
         "scan": "", "photo": "", "out": "", "source": "scan",
         "remesher": "decimate", "faces": 10000, "sharp": False,
-        "unwrap": "xatlas", "smart_angle": 66.0, "margin": 16,
-        "backend": "auto", "resolution": 2048, "ao_samples": 64, "cage": 0.01, "max_ray": 0.03,
+        "margin": 16,
+        "resolution": 2048, "ao_samples": 64, "cage": 0.01, "max_ray": 0.03,
         "roughness": 0.8, "roughness_variation": 0.25, "tiled": False, "keep_work": False,
     },
 }
 PATH_KEYS = {
-    "delight": {"model", "lit", "normal", "ao", "mask", "output_dir", "onnx_model"},
+    "delight": {"model", "lit", "normal", "ao", "mask", "output_dir"},
     "scan": {"scan", "photo", "out"},
 }
 CHOICES = {
+    ("delight", "ai_model"): models.names(),
     ("delight", "bit_depth"): [8, 16],
     ("delight", "tile_size"): [0, 512, 1024, 2048, 4096],
     ("scan", "source"): ["scan", "pbr"],
     ("scan", "remesher"): ["decimate", "autoremesher", "quadwild"],
-    ("scan", "unwrap"): ["xatlas", "smart"],
-    ("scan", "backend"): ["auto", "blender", "native"],
     ("scan", "resolution"): [512, 1024, 2048, 4096],
 }
 DESCRIPTIONS = {
@@ -67,24 +68,21 @@ DESCRIPTIONS = {
     ("delight", "mask"): "UV mask: white inside the UV islands",
     ("delight", "output_dir"): "output folder; empty = the lit map's folder",
     ("delight", "output_name"): "output file name",
-    ("delight", "onnx_model"): "de-lighter ONNX model; empty = newest trained one",
+    ("delight", "ai_model"): "de-lighter model bundled in models/ (overcast)",
     ("delight", "force_cpu"): "run inference on the CPU",
     ("delight", "tiled"): "tiled inference (less VRAM; 2048 px and up)",
     ("delight", "tile_size"): "tile size in px; 0 = half the image",
     ("delight", "tile_overlap"): "tile overlap, fraction of the tile (0.05-0.5)",
     ("delight", "bit_depth"): "output PNG bit depth",
     ("delight", "apply_mask"): "black out texels outside the UV islands",
-    ("scan", "scan"): "high-res scan: OBJ, PLY, FBX, GLB/glTF, STL",
+    ("scan", "scan"): "high-res scan or model: OBJ, PLY, GLB/glTF, STL",
     ("scan", "photo"): "photo texture (base colour for pbr); empty = taken from the material",
     ("scan", "out"): "output folder; empty = <scan>_optimized next to the scan",
     ("scan", "source"): "scan: photo scan, de-lit; pbr: model with PBR materials, baked as they are",
     ("scan", "remesher"): "decimate (triangles), autoremesher or quadwild (quads)",
     ("scan", "faces"): "target face count",
     ("scan", "sharp"): "quads: keep sharp feature edges (hard-surface scans)",
-    ("scan", "unwrap"): "UV unwrapper",
-    ("scan", "smart_angle"): "Smart UV Project angle limit, degrees",
     ("scan", "margin"): "texels of padding around each UV chart",
-    ("scan", "backend"): "bake backend: blender (Cycles) or native (Embree); auto = Blender if installed",
     ("scan", "resolution"): "texture size in px",
     ("scan", "ao_samples"): "AO samples per texel",
     ("scan", "cage"): "bake ray start offset, fraction of the bounds diagonal",
@@ -94,7 +92,7 @@ DESCRIPTIONS = {
     ("scan", "tiled"): "tiled de-light inference",
     ("scan", "keep_work"): "keep intermediate EXRs in <out>/work",
 }
-RESULT_PATH_KEYS = {"albedo", "glb", "obj", "fbx", "report", "textures", "out"}
+RESULT_PATH_KEYS = {"albedo", "glb", "obj", "report", "textures", "out"}
 
 
 class ProjectError(ValueError):

@@ -1,6 +1,6 @@
-"""Blender-free scanopt stages: reduce, unwrap, bake high->low and export, in plain Python.
+"""scanopt's stages: reduce, unwrap, bake high->low and export, in plain Python.
 
-Same job and same work files as blender_stage.py, built from permissively licensed parts:
+Built from permissively licensed parts:
     trimesh (MIT)               mesh import / glTF export
     fast-simplification (MIT)   quadric triangle decimation
     xatlas (MIT)                charting and packing
@@ -12,8 +12,8 @@ any number of materials): then base colour, roughness, metallic, normal and occl
 sampled at each hit, normal maps decoded in the model's tangent frame and re-encoded in the low
 mesh's.
 
-prep writes into the work folder:
-    lit.exr, normal_ts.exr, normal_os.exr, ao.exr, uv_tris.npy, prep.json   (as the Blender stage)
+The bake writes into the work folder:
+    lit.exr, normal_ts.exr, normal_os.exr, ao.exr, uv_tris.npy, prep.json
     roughness.exr, metallic.exr                                             (PBR models; lit = base colour)
     low.npz      the optimised mesh: positions, polygons, per-corner UVs, axis convention
 
@@ -143,7 +143,7 @@ def load_scan(path: Path, texture: Path | None):
     """The scan as welded triangles plus per-corner UVs, and its photo (linear RGB float32)."""
     import trimesh
     if path.suffix.lower() == ".fbx":
-        raise SystemExit("FBX scans need the Blender backend; convert the scan to OBJ, PLY or GLB")
+        raise SystemExit("FBX is not supported; export the scan as OBJ, PLY or glTF")
     mesh = None
     if path.suffix.lower() == ".obj":
         positions, faces, corner_uv = read_obj(path)
@@ -190,23 +190,13 @@ def write_triangle_obj(obj: Path, positions: np.ndarray, faces: np.ndarray):
         handle.write("".join(f"f {a} {b} {c}\n" for a, b, c in faces + 1))
 
 
-def predecimate(obj: Path, target: int) -> int:
-    """Reduce a triangle OBJ in place to `target` faces (skipped when it is already smaller)."""
-    positions, faces, _ = read_obj(obj)
-    positions, faces, _ = weld(positions, faces)
-    if len(faces) > target:
-        positions, faces = decimate(positions, faces, target)
-        write_triangle_obj(obj, positions, faces)
-    return len(faces)
-
-
 def export_high(scan: Path, obj: Path, target: int = 0) -> int:
     """Welded triangle OBJ of the scan for the external quad remeshers (axes as on disk),
     QEM-decimated to `target` faces first when given: the remeshers then run in seconds instead of
     minutes on multi-million-face scans, and the bake still projects from the full scan."""
     import trimesh
     if scan.suffix.lower() == ".fbx":
-        raise SystemExit("FBX scans need the Blender backend; convert the scan to OBJ, PLY or GLB")
+        raise SystemExit("FBX is not supported; export the scan as OBJ, PLY or glTF")
     if scan.suffix.lower() == ".obj":
         positions, faces, _ = read_obj(scan)
     else:
@@ -740,7 +730,7 @@ def bake(high, low, photo, resolution: int, cage: float, max_ray: float, ao_samp
                           np.sum(detail * normal, axis=1)], axis=1)
     normal_os = detail
 
-    # Ambient occlusion of the high-res surface; occluder distance as the Blender stage (10% of the diagonal).
+    # Ambient occlusion of the high-res surface; occluders count within 10% of the diagonal.
     face = high_pos[corners]
     geometric = normalise(np.cross(face[:, 1] - face[:, 0], face[:, 2] - face[:, 0]))
     geometric *= np.where(np.sum(geometric * hit_normal, axis=1) < 0, -1.0, 1.0)[:, None]
@@ -831,23 +821,6 @@ def bake_layout(scan: Path, texture: Path | None, out: Path, cage: float, max_ra
                                log, pbr=model)
     raw_pos, raw_faces, corner_uv, photo = load_scan(scan, texture)
     high_pos, high_faces, _ = weld(raw_pos, raw_faces)
-    return _bake_and_write(scan, out, high_pos, high_faces, corner_uv, photo, positions, sizes, loop_verts, loop_uv,
-                           tri_loops, unwrap_info, resolution, margin, cage, max_ray, ao_samples, topology, log)
-
-
-def prep(scan: Path, texture: Path | None, out: Path, faces: int, resolution: int, margin: int, cage: float,
-         max_ray: float, ao_samples: int, low_mesh: Path | None = None, topology: str = "tri", log=print) -> dict:
-    out.mkdir(parents=True, exist_ok=True)
-    raw_pos, raw_faces, corner_uv, photo = load_scan(scan, texture)
-    high_pos, high_faces, _ = weld(raw_pos, raw_faces)
-    if low_mesh:
-        positions, sizes, loop_verts = read_polygon_obj(low_mesh)
-    else:
-        positions, triangles = decimate(high_pos, high_faces, faces)
-        sizes, loop_verts = np.full(len(triangles), 3, np.int64), triangles.reshape(-1)
-    tri_loops, tri_poly = fan(sizes)
-    loop_uv, unwrap_info = unwrap(positions, loop_verts, tri_loops, tri_poly, resolution, margin)
-    log(f"UNWRAP {unwrap_info}")
     return _bake_and_write(scan, out, high_pos, high_faces, corner_uv, photo, positions, sizes, loop_verts, loop_uv,
                            tri_loops, unwrap_info, resolution, margin, cage, max_ray, ao_samples, topology, log)
 
