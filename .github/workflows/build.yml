@@ -1,0 +1,42 @@
+# Builds the Windows folder app (BakeDelight-windows.zip). Run it from the Actions tab, or push a
+# v* tag to also attach the zip to that release. The de-lighter model is not in git: it is read
+# from the release tagged model-overcast.
+name: Build Windows app
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: python -m pip install -r packaging/requirements.txt
+      - name: Fetch the de-lighter model
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download model-overcast --pattern overcast.onnx --dir models
+      - name: Build
+        run: pyinstaller packaging/BakeDelight.spec --noconfirm
+      - name: Smoke test the scan job
+        run: dist/BakeDelight/BakeDelightJob.exe --help
+      - name: Zip
+        run: Compress-Archive -Path dist/BakeDelight -DestinationPath BakeDelight-windows.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BakeDelight-windows
+          path: BakeDelight-windows.zip
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.ref_name }} BakeDelight-windows.zip --clobber

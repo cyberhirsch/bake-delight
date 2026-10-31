@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 weights/
 models/*.onnx
+build/
+dist/

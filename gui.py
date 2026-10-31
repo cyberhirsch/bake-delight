@@ -974,11 +974,15 @@ class DelighterGUI(TuiWidgets):
 
     # ================================================================ scan optimiser
 
-    def _scanopt_python(self):
-        """scanopt needs OpenCV with EXR support; prefer the training environment that has it."""
+    def _scanopt_command(self):
+        """How to start scanopt: the packaged BakeDelightJob.exe next to the app, else a Python with
+        OpenCV EXR support (the training environment when there is one)."""
+        if getattr(sys, "frozen", False):
+            return [os.path.join(os.path.dirname(sys.executable), "BakeDelightJob.exe")]
         chosen = self.var["scanopt_python"].get().strip()
         candidate = os.path.join(APP_DIR, "training", ".venv", "Scripts", "python.exe")
-        return chosen or os.environ.get("SCANOPT_PYTHON") or (candidate if os.path.isfile(candidate) else sys.executable)
+        python = chosen or os.environ.get("SCANOPT_PYTHON") or (candidate if os.path.isfile(candidate) else sys.executable)
+        return [python, "-u", SCANOPT_SCRIPT]
 
     def _scan_out(self):
         scan = self.var["scan"].get().strip()
@@ -1011,7 +1015,7 @@ class DelighterGUI(TuiWidgets):
         out = self._scan_out()
         photo = self.var["photo"].get().strip()
         remesher = self.var["remesher"].get()
-        command = [self._scanopt_python(), "-u", SCANOPT_SCRIPT, scan, "--out", out, "--source", self.var["source"].get(), "--faces", str(faces),
+        command = [*self._scanopt_command(), scan, "--out", out, "--source", self.var["source"].get(), "--faces", str(faces),
                    "--remesher", REMESHERS[remesher], "--resolution", self.var["resolution"].get(),
                    "--margin", str(numbers["margin"]), "--ao-samples", str(numbers["ao_samples"]),
                    "--cage", f"{self._value('cage', float):.4f}", "--max-ray", f"{self._value('max_ray', float):.4f}",
@@ -1347,8 +1351,12 @@ class DelighterGUI(TuiWidgets):
         self.root.mainloop()
 
 
-if __name__ == "__main__":
+def main():
     app = DelighterGUI()
     if len(sys.argv) > 1 and sys.argv[1].lower().endswith(PROJECT_SUFFIX):
         app.root.after(200, lambda: app._open_project(sys.argv[1]))  # double-clicked .bad file
     app.run()
+
+
+if __name__ == "__main__":
+    main()

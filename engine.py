@@ -83,6 +83,9 @@ def _hardware_name_for_provider(provider: str) -> str:
                 pass
         return "NVIDIA GPU"
 
+    if provider == "DmlExecutionProvider":
+        return "GPU (DirectX 12)"
+
     return provider.replace("ExecutionProvider", "") + " device"
 
 
@@ -159,9 +162,15 @@ class DelighterInferenceEngine:
                 ),
                 "CPUExecutionProvider",
             ]
+        elif "DmlExecutionProvider" in available_providers:  # onnxruntime-directml: any DX12 GPU, no CUDA install
+            providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
         else:
             providers = ["CPUExecutionProvider"]
-        
+        session_options = ort.SessionOptions()
+        if providers[0] == "DmlExecutionProvider":  # DirectML needs these off
+            session_options.enable_mem_pattern = False
+            session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
         resolved_model_path = Path(model_path)
         if not resolved_model_path.is_absolute():
             if getattr(sys, "frozen", False):
@@ -175,7 +184,7 @@ class DelighterInferenceEngine:
             raise FileNotFoundError(f"Model file not found: {resolved_model_path}")
 
         try:
-            self.model = ort.InferenceSession(str(resolved_model_path), providers=providers)
+            self.model = ort.InferenceSession(str(resolved_model_path), sess_options=session_options, providers=providers)
         except Exception as provider_error:
             if providers and providers[0] != "CPUExecutionProvider" and not force_cpu:
                 failed_provider = providers[0][0] if isinstance(providers[0], tuple) else providers[0]
@@ -193,6 +202,7 @@ class DelighterInferenceEngine:
         self.runtime_name = "ONNX Runtime"
         self.provider_name = {
             "CUDAExecutionProvider": "CUDA",
+            "DmlExecutionProvider": "DirectML",
         }.get(self.execution_provider, "CPU")
         self.is_accelerated = self.execution_provider != "CPUExecutionProvider"
         self.device_info = f"{self.hardware_device} via {self.runtime_name} / {self.provider_name}"
