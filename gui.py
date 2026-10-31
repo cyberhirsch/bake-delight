@@ -586,7 +586,7 @@ class DelighterGUI(TuiWidgets):
         self._path_row(tab, "HIGH-RES SCAN", "scan", filetypes=[("Meshes", "*.obj *.ply *.glb *.gltf *.stl")],
                        on_change=self._on_scan_chosen)
         self._path_row(tab, "PHOTO TEXTURE", "photo", filetypes=[("Images", "*.png *.jpg *.jpeg *.tif *.tiff *.exr")])
-        self._label(tab, "│   empty = taken from the material · pbr: base colour override", color=HINT, size=11).grid(
+        self._label(tab, "│   empty = from the material · pbr: base colour", color=HINT, size=11).grid(
             row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
         tab.next_row += 1
         self._section(tab, "low-res mesh")
