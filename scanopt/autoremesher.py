@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
-DEFAULT_DIR = Path(os.environ.get("AUTOREMESHER_DIR", r"F:\DelighterData\tools\autoremesher"))
+# AUTOREMESHER_DIR, else the copy shipped in the packaged app's tools/ folder, else the development machine's.
+DEFAULT_DIR = Path(os.environ.get("AUTOREMESHER_DIR") or (Path(sys.executable).parent / "tools" / "autoremesher"
+                                                          if getattr(sys, "frozen", False)
+                                                          else r"F:\DelighterData\tools\autoremesher"))
 
 
 def count_faces(obj: Path) -> int:

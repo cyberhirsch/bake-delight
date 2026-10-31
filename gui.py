@@ -63,7 +63,7 @@ DEFAULTS = {
     "texture_filter": "mipmap", "background": "Charcoal", "orbit_speed": 0.5, "zoom_step": 1.14,
     "autorotate": False, "autorotate_speed": 20.0,
     # system
-    "quadwild_dir": r"F:\DelighterData\tools\quadwild-bimdf", "autoremesher_dir": r"F:\DelighterData\tools\autoremesher",
+    "quadwild_dir": r"F:\DelighterData\tools\quadwild-bimdf", "autoremesher_dir": "",
     "scanopt_python": "", "ui_scale": 1.0, "log_lines": "2000",
 }
 
@@ -711,6 +711,9 @@ class DelighterGUI(TuiWidgets):
         self._section(tab, "tools")
         self._path_row(tab, "QUADWILD DIR", "quadwild_dir", kind="dir")
         self._path_row(tab, "AUTOREMESHER", "autoremesher_dir", kind="dir")
+        self._label(tab, "│   empty = the copy shipped with the app", color=HINT, size=11).grid(
+            row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
+        tab.next_row += 1
         self._path_row(tab, "SCANOPT PY", "scanopt_python", filetypes=[("python.exe", "*.exe")])
         self._label(tab, "│   empty = training/.venv, else this interpreter", color=HINT, size=11).grid(
             row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
@@ -1022,8 +1025,9 @@ class DelighterGUI(TuiWidgets):
                    "--roughness", f"{self._value('roughness', float):.3f}",
                    "--roughness-variation", f"{self._value('roughness_variation', float):.3f}",
                    "--predecimate", f"{self._value('predecimate', float):.1f}",
-                   "--quadwild", self.var["quadwild_dir"].get(), "--autoremesher", self.var["autoremesher_dir"].get(),
-                   "--model", self.var["ai_model"].get(), "--stage", stage]
+                   "--quadwild", self.var["quadwild_dir"].get(), "--model", self.var["ai_model"].get(), "--stage", stage]
+        if self.var["autoremesher_dir"].get().strip():
+            command += ["--autoremesher", self.var["autoremesher_dir"].get().strip()]
         if photo:
             command += ["--texture", photo]
         for key, flag in (("sharp", "--sharp"), ("scan_tiled", "--tiled"), ("keep_work", "--keep-work")):

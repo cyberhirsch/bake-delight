@@ -1,0 +1,35 @@
+Bake & Delight - third-party software
+=====================================
+
+Bake & Delight builds on the following software. Each keeps its own licence;
+the full texts are in this folder or named below.
+
+AI Texture De-Lighter (vdmrcll)            MIT          LICENSE-ai-texture-delighter.txt
+  The original de-lighting code this app grew out of.
+
+AutoRemesher 1.2.0 (Dust3D Project)        MIT          autoremesher-LICENSE.txt
+  Shipped unchanged in tools/autoremesher, run as a separate program.
+  Source: https://github.com/huxingyi/autoremesher
+
+Qt 5 (The Qt Company)                      LGPL-3.0     lgpl-3.0.txt, gpl-3.0.txt
+  Qt5Core, Qt5Gui, Qt5Svg, Qt5Widgets, Qt5WinExtras and the Qt plugins in
+  tools/autoremesher, dynamically linked and unmodified, as distributed with
+  AutoRemesher 1.2.0. You may replace these DLLs with your own build of Qt 5.
+  Qt source code: https://download.qt.io/archive/qt/5.15/
+
+Python runtime and packages bundled in _internal:
+  CPython                                  PSF License
+  ONNX Runtime (DirectML)                  MIT
+  OpenCV                                   Apache-2.0
+  NumPy, SciPy                             BSD-3-Clause
+  Pillow                                   MIT-CMU (HPND)
+  trimesh                                  MIT
+  Intel Embree / embreex                   Apache-2.0 / BSD
+  xatlas (python-xatlas)                   MIT
+  fast-simplification                      MIT
+  CustomTkinter                            MIT
+  tkinterdnd2 / tkdnd                      MIT / BSD-style
+  PyOpenGL, pyopengltk                     BSD-style / MIT
+  Tcl/Tk                                   Tcl/Tk licence (BSD-style)
+
+Training data for the de-lighter model: Poly Haven assets and HDRIs, CC0.

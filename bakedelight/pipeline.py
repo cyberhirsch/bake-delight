@@ -25,7 +25,7 @@ SCANOPT_SCRIPT = REPO / "scanopt" / "scanopt.py"
 SETTINGS_PATH = Path(os.environ.get("APPDATA", os.path.expanduser("~"))) / "TextureDelighter" / "settings.json"
 MACHINE_DEFAULTS = {
     "quadwild_dir": r"F:\DelighterData\tools\quadwild-bimdf",
-    "autoremesher_dir": r"F:\DelighterData\tools\autoremesher",
+    "autoremesher_dir": "",  # empty: scanopt's default (the copy shipped with the packaged app)
     "scanopt_python": "",
 }
 
@@ -99,8 +99,9 @@ def scan_command(project: Project, machine: dict | None = None) -> tuple[list[st
                "--margin", str(s["margin"]), "--ao-samples", str(s["ao_samples"]),
                "--cage", f"{s['cage']:.4f}", "--max-ray", f"{s['max_ray']:.4f}",
                "--roughness", f"{s['roughness']:.3f}", "--roughness-variation", f"{s['roughness_variation']:.3f}",
-               "--quadwild", machine["quadwild_dir"], "--autoremesher", machine["autoremesher_dir"],
-               "--model", project.settings["delight"]["ai_model"]]
+               "--quadwild", machine["quadwild_dir"], "--model", project.settings["delight"]["ai_model"]]
+    if machine["autoremesher_dir"]:
+        command += ["--autoremesher", machine["autoremesher_dir"]]
     if s["photo"]:
         command += ["--texture", s["photo"]]
     for key, flag in (("sharp", "--sharp"), ("tiled", "--tiled"), ("keep_work", "--keep-work")):

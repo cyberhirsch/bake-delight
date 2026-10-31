@@ -90,7 +90,7 @@ def main() -> int:
     parser.add_argument("--roughness-variation", type=float, default=0.25)
     parser.add_argument("--model", default=models.DEFAULT, help=f"de-lighter model: {', '.join(models.names())}")
     parser.add_argument("--quadwild", type=Path, help="QuadWild-BiMDF folder (default: QUADWILD_DIR or F:/DelighterData/tools/quadwild-bimdf)")
-    parser.add_argument("--autoremesher", type=Path, help="AutoRemesher folder (default: AUTOREMESHER_DIR or F:/DelighterData/tools/autoremesher)")
+    parser.add_argument("--autoremesher", type=Path, help="AutoRemesher folder (default: AUTOREMESHER_DIR, else the copy shipped with the app)")
     parser.add_argument("--margin", type=int, default=16, help="texels of padding around each UV chart")
     parser.add_argument("--ao-samples", type=int, default=64)
     parser.add_argument("--cage", type=float, default=0.01, help="bake ray start offset, fraction of the bounds diagonal")

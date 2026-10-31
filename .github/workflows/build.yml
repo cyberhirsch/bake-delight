@@ -27,8 +27,25 @@ jobs:
         run: gh release download model-overcast --pattern overcast.onnx --dir models
       - name: Build
         run: pyinstaller packaging/BakeDelight.spec --noconfirm
-      - name: Smoke test the scan job
-        run: dist/BakeDelight/BakeDelightJob.exe --help
+      - name: Add AutoRemesher 1.2.0 (MIT) and the licence notices
+        run: |
+          $zip = "autoremesher.zip"
+          Invoke-WebRequest https://github.com/huxingyi/autoremesher/releases/download/1.2.0/autoremesher-1.2.0-win32-x86_64.zip -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne "F6184622CEF84F0BCF032A0474DF44E2076F4C10C159F1AF0CB7230259AF7476") {
+            throw "the AutoRemesher download does not match the 1.2.0 release"
+          }
+          Expand-Archive $zip dist/BakeDelight/tools/autoremesher
+          Copy-Item packaging/licenses/autoremesher-LICENSE.txt dist/BakeDelight/tools/autoremesher/LICENSE.txt
+          New-Item -ItemType Directory dist/BakeDelight/licenses | Out-Null
+          Copy-Item packaging/licenses/* dist/BakeDelight/licenses
+          Copy-Item LICENSE dist/BakeDelight/licenses/LICENSE-ai-texture-delighter.txt
+          Invoke-WebRequest https://www.gnu.org/licenses/lgpl-3.0.txt -OutFile dist/BakeDelight/licenses/lgpl-3.0.txt
+          Invoke-WebRequest https://www.gnu.org/licenses/gpl-3.0.txt -OutFile dist/BakeDelight/licenses/gpl-3.0.txt
+      - name: Smoke test the scan job with the bundled AutoRemesher
+        run: |
+          python -c "import trimesh; trimesh.creation.icosphere(subdivisions=4).export('sphere.obj')"
+          dist/BakeDelight/BakeDelightJob.exe sphere.obj --out smoke --remesher autoremesher --faces 300 --stage remesh
+          if (-not (Test-Path smoke/work/low.obj)) { throw "the remesh stage wrote no mesh" }
       - name: Zip
         run: Compress-Archive -Path dist/BakeDelight -DestinationPath BakeDelight-windows.zip
       - uses: actions/upload-artifact@v4
