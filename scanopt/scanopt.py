@@ -13,6 +13,11 @@ heuristic derives roughness; the glTF PBR asset is assembled and exported as
 Backends (--backend): blender (Cycles bake, needs Blender) or native (trimesh,
 fast-simplification, xatlas and Embree in plain Python, no Blender). auto picks
 Blender when it is installed.
+
+Sources (--source): scan (photo texture with the light in it, de-lit) or pbr (a
+high-res model with PBR materials, glTF or OBJ + MTL: base colour, roughness,
+metallic, normal and occlusion are baked as they are, without de-lighting; native
+backend only). --map-* replace the model's own maps.
 """
 
 from __future__ import annotations
@@ -89,7 +94,12 @@ def write_png8(path: Path, image: np.ndarray) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input", type=Path, help="high-res scan: OBJ, PLY, FBX, GLB/glTF")
-    parser.add_argument("--texture", type=Path, help="photo texture (default: taken from the scan's material)")
+    parser.add_argument("--texture", type=Path, help="photo texture, or base colour for --source pbr (default: taken from the material)")
+    parser.add_argument("--source", choices=["scan", "pbr"], default="scan",
+                        help="scan: photo scan, de-lit; pbr: model with PBR materials, baked as they are")
+    for key, text in (("roughness", "roughness"), ("metallic", "metallic"), ("normal", "tangent-space normal (OpenGL, +Y)"),
+                      ("ao", "ambient occlusion")):
+        parser.add_argument(f"--map-{key}", type=Path, help=f"--source pbr: {text} map replacing the material's")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--faces", type=int, default=10000)
     parser.add_argument("--remesher", choices=list(REMESHERS), default="decimate")
@@ -124,6 +134,9 @@ def main() -> int:
     args.input, args.out = args.input.resolve(), args.out.resolve()  # Blender resolves relative paths elsewhere
     args.texture = args.texture.resolve() if args.texture else None
     native = args.backend == "native" or (args.backend == "auto" and not Path(args.blender).is_file())
+    if args.source == "pbr" and not native:
+        print("the PBR bake runs on the native backend", flush=True)
+        native = True
     if native and (missing := native_stage.available()):
         raise SystemExit(f"The native backend needs: {missing}")
     if not native and not Path(args.blender).is_file():
@@ -198,8 +211,11 @@ def main() -> int:
             print(f"{tag} baking high->low ({'Embree' if native else 'Cycles'})", flush=True)
             if native:
                 need(work / "layout.npz", "uv")
+                maps = {"roughness": args.map_roughness, "metallic": args.map_metallic, "normal": args.map_normal,
+                        "occlusion": args.map_ao}
                 native_stage.bake_layout(args.input, args.texture, work, args.cage, args.max_ray, args.ao_samples,
-                                         topology="quad" if quads else "tri", log=lambda text: print(text, flush=True))
+                                         topology="quad" if quads else "tri", log=lambda text: print(text, flush=True),
+                                         source=args.source, maps={k: v.resolve() for k, v in maps.items() if v})
             elif not (work / "prep.json").is_file() or (work / "prep.json").stat().st_mtime < (work / "low.obj").stat().st_mtime:
                 need(work / "low.obj", "remesh")
                 run_blender_prep(args, work, quads)
@@ -209,6 +225,11 @@ def main() -> int:
 
         elif stage == "delight":
             need(work / "lit.png", "bake")
+            if baked_source(work) == "pbr":
+                print(f"{tag} PBR model: its base colour is the albedo, no de-lighting", flush=True)
+                write_png8(work / "albedo_raw.png", to_srgb(read_exr(work / "lit.exr")))
+                done("delight", since, model=None, device=None)
+                continue
             model = args.model or next((p for p in MODEL_CANDIDATES if p.is_file()), None)
             if model is None:
                 raise SystemExit("No de-lighter model found; pass --model")
@@ -247,6 +268,14 @@ def run_blender_prep(args, work: Path, quads: bool) -> None:
     blender(args.blender, *prep)
 
 
+def baked_source(work: Path) -> str:
+    """What the bake stage baked from: "scan" or "pbr" (its maps are then used as they are)."""
+    try:
+        return json.loads((work / "prep.json").read_text()).get("source", "scan")
+    except (OSError, ValueError):
+        return "scan"
+
+
 def write_delight_inputs(work: Path, resolution: int) -> None:
     """The baked EXRs as the de-lighter's inputs (16-bit PNGs) plus the UV coverage mask."""
     mask = rasterise_mask(np.load(work / "uv_tris.npy"), resolution)
@@ -265,10 +294,15 @@ def export(args, work: Path, name: str, native: bool, quads: bool) -> Path:
     write_png8(work / "lit8.png", fill_gutter(to_srgb(lit), mask))  # the photo before de-lighting, for comparison
     write_png8(work / "normal.png", normal_ts)  # already extended into the gutter by the bake
     write_png8(work / "ao8.png", np.clip(ao, 0, 1))
-    write_png8(work / "roughness.png", fill_gutter(roughness_map(normal_ts, ao, mask, args.roughness, args.roughness_variation)[..., None], mask)[..., 0])
+    pbr = baked_source(work) == "pbr"
+    if pbr:  # the model's own roughness and metallic, already extended into the gutter by the bake
+        write_png8(work / "roughness.png", read_exr(work / "roughness.exr")[..., 0])
+        write_png8(work / "metallic.png", read_exr(work / "metallic.exr")[..., 0])
+    else:
+        write_png8(work / "roughness.png", fill_gutter(roughness_map(normal_ts, ao, mask, args.roughness, args.roughness_variation)[..., None], mask)[..., 0])
     glb = args.out / f"{name}.glb"
     if native:
-        native_stage.assemble(work, glb, name)  # the OBJ keeps quads; no FBX without Blender
+        native_stage.assemble(work, glb, name, metallic=pbr)  # the OBJ keeps quads; no FBX without Blender
     else:
         shutil.copy(work / "ao8.png", work / "ao.png")  # the Blender material reads ao.png
         assemble = [str(work / "low.blend"), "assemble", "--out", str(work), "--export", str(glb)]
@@ -276,7 +310,7 @@ def export(args, work: Path, name: str, native: bool, quads: bool) -> Path:
     textures = args.out / "textures"
     textures.mkdir(exist_ok=True)
     for source, target in [("albedo.png", "albedo"), ("normal.png", "normal_gl"), ("roughness.png", "roughness"),
-                           ("ao8.png", "ao"), ("lit8.png", "lit")]:
+                           ("ao8.png", "ao"), ("lit8.png", "lit")] + ([("metallic.png", "metallic")] if pbr else []):
         shutil.copy(work / source, textures / f"{name}_{target}.png")
     return glb
 

@@ -7,8 +7,14 @@ Same job and same work files as blender_stage.py, built from permissively licens
     Intel Embree via embreex    ray casting for the photo, normal and AO transfer
                                 (Apache-2.0 / BSD)
 
+The high mesh is a photo scan (one photo texture, to be de-lit) or a PBR model (glTF or OBJ + MTL,
+any number of materials): then base colour, roughness, metallic, normal and occlusion maps are
+sampled at each hit, normal maps decoded in the model's tangent frame and re-encoded in the low
+mesh's.
+
 prep writes into the work folder:
     lit.exr, normal_ts.exr, normal_os.exr, ao.exr, uv_tris.npy, prep.json   (as the Blender stage)
+    roughness.exr, metallic.exr                                             (PBR models; lit = base colour)
     low.npz      the optimised mesh: positions, polygons, per-corner UVs, axis convention
 
 Normals in normal_os.exr use Blender's axes (Z up), like the training data. Formats that
@@ -72,10 +78,13 @@ def _numbers(lines: list[bytes], columns: int, dtype) -> np.ndarray:
     return values.reshape(len(lines), -1)[:, :columns]
 
 
-def read_obj(path: Path):
+def read_obj(path: Path, details: bool = False):
     """Positions, triangles and per-corner UVs (or None) of an OBJ. trimesh's reader needs tens of
-    minutes for a scan of several hundred MB; this one parses each record type with numpy in one go."""
-    v, vt, f = [], [], []
+    minutes for a scan of several hundred MB; this one parses each record type with numpy in one go.
+    details=True also returns per-corner normals (or None), each triangle's material index, the
+    material names and the mtllib files."""
+    v, vt, vn, f = [], [], [], []
+    switches, libraries = [], []  # (face line, material name); MTL files
     with path.open("rb") as handle:
         for line in handle:
             if line[:2] == b"v ":
@@ -84,29 +93,50 @@ def read_obj(path: Path):
                 vt.append(line[3:])
             elif line[:2] == b"f ":
                 f.append(line[2:])
+            elif details and line[:3] == b"vn ":
+                vn.append(line[3:])
+            elif details and line[:7] == b"usemtl ":
+                switches.append((len(f), line[7:].strip().decode("utf-8", "replace")))
+            elif details and line[:7] == b"mtllib ":
+                libraries.append(line[7:].strip().decode("utf-8", "replace"))
     if not f:
-        return np.zeros((0, 3)), np.zeros((0, 3), np.int64), None
+        empty = np.zeros((0, 3)), np.zeros((0, 3), np.int64), None
+        return (*empty, None, np.zeros(0, np.int64), [], libraries) if details else empty
     positions = _numbers(v, 3, np.float64)
     texcoords = _numbers(vt, 2, np.float64) if vt else None
-    del v, vt
+    normals = _numbers(vn, 3, np.float64) if vn else None
+    del v, vt, vn
     fields = f[0].split()[0].count(b"/") + 1
     text = b" ".join(f).replace(b"//", b"/0/").replace(b"/", b" ")
     corners = np.array(text.split(), np.int64)
     if len(corners) == len(f) * 3 * fields:
         corners = corners.reshape(-1, 3, fields)
+        per_line = np.ones(len(f), np.int64)
     else:  # polygons: fan-triangulate line by line
-        triangles = []
+        triangles, per_line = [], []
         for line in f:
             polygon = np.array(line.replace(b"//", b"/0/").replace(b"/", b" ").split(), np.int64).reshape(-1, fields)
             triangles += [(polygon[0], polygon[k], polygon[k + 1]) for k in range(1, len(polygon) - 1)]
+            per_line.append(len(polygon) - 2)
         corners = np.array(triangles, np.int64)
+        per_line = np.array(per_line, np.int64)
     faces = corners[..., 0]
     faces = np.where(faces < 0, faces + len(positions), faces - 1)
     corner_uv = None
     if texcoords is not None and fields > 1:
         uv_index = corners[..., 1]
         corner_uv = texcoords[np.where(uv_index < 0, uv_index + len(texcoords), uv_index - 1)]
-    return positions, faces, corner_uv
+    if not details:
+        return positions, faces, corner_uv
+    corner_normals = None
+    if normals is not None and fields > 2:
+        normal_index = corners[..., 2]
+        corner_normals = normals[np.where(normal_index < 0, normal_index + len(normals), normal_index - 1)]
+    names = list(dict.fromkeys(name for _, name in switches)) or [""]
+    line_material = np.zeros(len(f), np.int64)
+    for (start, name), following in zip(switches, switches[1:] + [(len(f), None)]):
+        line_material[start:following[0]] = names.index(name)
+    return positions, faces, corner_uv, corner_normals, np.repeat(line_material, per_line), names, libraries
 
 
 def load_scan(path: Path, texture: Path | None):
@@ -373,6 +403,253 @@ def sample_photo(photo: np.ndarray, uv: np.ndarray) -> np.ndarray:
     return values.reshape(-1, photo.shape[2])[:len(uv)]
 
 
+# ---------------------------------------------------------------- PBR sources
+
+PBR_MAPS = ("base_color", "roughness", "metallic", "occlusion")
+
+
+def _float_image(image, srgb: bool) -> np.ndarray:
+    """A PIL image or OpenCV array as float32 H x W x C; 8/16-bit sRGB colour is made linear."""
+    array = np.asarray(image)
+    if array.ndim == 2:
+        array = array[..., None]
+    if array.dtype == np.uint8:
+        array = array.astype(np.float32) / 255
+    elif array.dtype == np.uint16:
+        array = array.astype(np.float32) / 65535
+    else:
+        return array.astype(np.float32)  # EXR / float TIFF: already linear
+    return srgb_to_linear(array) if srgb else array
+
+
+def read_map(path: Path, srgb: bool) -> np.ndarray:
+    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise SystemExit(f"Cannot read the texture {path}")
+    if image.ndim == 3:
+        image = cv2.cvtColor(image[..., :3], cv2.COLOR_BGR2RGB)
+    return _float_image(image, srgb)
+
+
+class Material:
+    """One PBR material: per map an image (float32, H x W x C, linear) or None, times a constant factor."""
+
+    def __init__(self, name: str = ""):
+        self.name = name
+        self.images: dict[str, np.ndarray | None] = {key: None for key in (*PBR_MAPS, "normal")}
+        self.factors = {"base_color": np.ones(3, np.float32), "roughness": 1.0, "metallic": 0.0, "occlusion": 1.0}
+
+    def set_map(self, key: str, image: np.ndarray, channel: int | None = None):
+        """A map that is the value itself (MTL maps, overrides): its factor becomes 1."""
+        self.images[key] = image if channel is None else image[..., channel:channel + 1]
+        if key in self.factors:
+            self.factors[key] = np.ones(3, np.float32) if key == "base_color" else 1.0
+
+    def sample(self, uv: np.ndarray) -> dict:
+        out = {}
+        for key in PBR_MAPS:
+            image, factor = self.images[key], self.factors[key]
+            columns = 3 if key == "base_color" else 1
+            value = sample_photo(image, uv)[:, :columns] if image is not None else np.ones((len(uv), columns), np.float32)
+            if value.shape[1] < columns:  # grey base colour image
+                value = np.repeat(value[:, :1], columns, axis=1)
+            out[key] = value * np.asarray(factor, np.float32)
+        if self.images["normal"] is not None:
+            out["normal"] = sample_photo(self.images["normal"], uv)[:, :3] * 2 - 1
+        return out
+
+
+def _looks_like_normal_map(image: np.ndarray) -> bool:
+    """OBJ's map_Bump holds either a height map or a tangent-space normal map: tell them apart."""
+    if image.shape[2] < 3:
+        return False
+    mean = image[::8, ::8, :3].reshape(-1, 3).mean(axis=0)
+    return abs(mean[0] - 0.5) < 0.15 and abs(mean[1] - 0.5) < 0.15 and mean[2] > 0.6
+
+
+def _mtl_file(value: str, folder: Path) -> Path | None:
+    """The file name of an MTL map statement, with options such as -bm 1 or -s 1 1 1 removed."""
+    tokens, k = value.split(), 0
+    while k < len(tokens) and tokens[k].startswith("-"):
+        k += 1
+        while k < len(tokens) - 1 and (tokens[k].replace(".", "", 1).lstrip("-").isdigit() or tokens[k] in ("on", "off")):
+            k += 1
+    name = " ".join(tokens[k:]).strip('"')
+    if not name:
+        return None
+    for candidate in (folder / name, folder / Path(name).name, folder / "textures" / Path(name).name):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def read_mtl(libraries: list[str], folder: Path, names: list[str], log=print) -> list[Material]:
+    statements: dict[str, dict[str, str]] = {}
+    current = None
+    for library in libraries:
+        path = folder / library
+        if not path.is_file():
+            log(f"  material library {library} not found")
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, _, value = line.strip().partition(" ")
+            if key == "newmtl":
+                current = statements.setdefault(value.strip(), {})
+            elif current is not None and key:
+                current[key.lower()] = value.strip()
+    materials = []
+    for name in names:
+        material, values = Material(name), statements.get(name, {})
+        if "kd" in values:
+            material.factors["base_color"] = np.array([float(x) for x in values["kd"].split()[:3]], np.float32)
+        for key, factor in (("roughness", "pr"), ("metallic", "pm")):
+            if factor in values:
+                material.factors[key] = float(values[factor].split()[0])
+        for key, statement, srgb in (("base_color", "map_kd", True), ("roughness", "map_pr", False),
+                                     ("metallic", "map_pm", False), ("occlusion", "map_ka", False)):
+            path = _mtl_file(values[statement], folder) if statement in values else None
+            if path:  # Kd next to map_Kd is usually a preview colour: the map wins
+                material.set_map(key, read_map(path, srgb), channel=None if key == "base_color" else 0)
+        for statement in ("norm", "map_bump", "bump"):
+            path = _mtl_file(values[statement], folder) if statement in values else None
+            if path:
+                image = read_map(path, srgb=False)
+                if _looks_like_normal_map(image):
+                    material.images["normal"] = image
+                else:
+                    log(f"  {path.name} is a height map, not a normal map: skipped")
+                break
+        materials.append(material)
+    return materials
+
+
+def _gltf_material(source) -> Material:
+    """trimesh's material of a glTF primitive (or of a textured PLY) as a Material."""
+    from trimesh.visual.material import PBRMaterial
+    material = Material(getattr(source, "name", "") or "")
+    if source is None:
+        return material
+    if getattr(source, "baseColorFactor", None) is not None:  # linear in glTF; trimesh keeps it as 0-255
+        factor = np.asarray(source.baseColorFactor, np.float32)[:3]
+        material.factors["base_color"] = factor / 255 if np.asarray(source.baseColorFactor).dtype == np.uint8 else factor
+    image = getattr(source, "baseColorTexture", None) or getattr(source, "image", None)
+    if image is not None:
+        material.images["base_color"] = _float_image(image.convert("RGB"), srgb=True)
+    if not isinstance(source, PBRMaterial):
+        return material
+    # glTF defaults: metallic and roughness factors 1
+    material.factors["roughness"] = 1.0 if source.roughnessFactor is None else float(source.roughnessFactor)
+    material.factors["metallic"] = 1.0 if source.metallicFactor is None else float(source.metallicFactor)
+    image = source.metallicRoughnessTexture
+    if image is not None:  # glTF: G roughness, B metallic
+        array = _float_image(image.convert("RGB"), srgb=False)
+        material.images["roughness"], material.images["metallic"] = array[..., 1:2], array[..., 2:3]
+    image = getattr(source, "occlusionTexture", None)
+    if image is not None:
+        material.images["occlusion"] = _float_image(image.convert("RGB"), srgb=False)[..., 0:1]
+    image = getattr(source, "normalTexture", None)
+    if image is not None:
+        material.images["normal"] = _float_image(image.convert("RGB"), srgb=False)
+    return material
+
+
+class PbrSource:
+    """A high-res model with PBR materials: triangles, per-corner UVs and normals, each triangle's
+    material. Normal maps are decoded with the model's own tangent frame (as glTF viewers do)."""
+
+    def __init__(self, positions, faces, corner_uv, corner_normals, face_material, materials: list[Material]):
+        self.positions, self.faces, self.corner_uv = positions, faces, corner_uv
+        if corner_normals is None:  # smooth normals across welded positions
+            welded, welded_faces, _ = weld(positions, faces)
+            corner_normals = vertex_normals(welded, welded_faces)[welded_faces]
+        self.corner_normals = normalise(corner_normals)
+        self.face_material, self.materials = face_material, materials
+        self.tangents = None
+        if any(m.images["normal"] is not None for m in materials):
+            count = len(faces)
+            tangent, sign = loop_tangents(positions, faces.reshape(-1), corner_uv.reshape(-1, 2),
+                                          np.arange(3 * count).reshape(count, 3), self.corner_normals.reshape(-1, 3))
+            self.tangents = tangent.reshape(count, 3, 3), sign.reshape(count, 3)
+
+    def normal_at(self, prim, weights):
+        return normalise(np.einsum("nk,nkc->nc", weights, self.corner_normals[prim]))
+
+    def sample(self, prim, weights, normal) -> dict:
+        """Every map at the hit points; 'normal' is the normal-mapped world normal."""
+        uv = np.einsum("nk,nkc->nc", weights, self.corner_uv[prim]).astype(np.float32)
+        out = {"base_color": np.zeros((len(prim), 3), np.float32), "normal": normal.copy(),
+               **{key: np.zeros((len(prim), 1), np.float32) for key in PBR_MAPS[1:]}}
+        material_of_hit = self.face_material[prim]
+        for index, material in enumerate(self.materials):
+            hits = np.nonzero(material_of_hit == index)[0]
+            if not len(hits):
+                continue
+            values = material.sample(uv[hits])
+            for key in PBR_MAPS:
+                out[key][hits] = values[key]
+            if "normal" in values and self.tangents is not None:
+                n = normal[hits]
+                t = np.einsum("nk,nkc->nc", weights[hits], self.tangents[0][prim[hits]])
+                t = normalise(t - n * np.sum(t * n, axis=1, keepdims=True))
+                s = np.where(np.einsum("nk,nk->n", weights[hits], self.tangents[1][prim[hits]]) < 0, -1.0, 1.0)
+                b = np.cross(n, t) * s[:, None]
+                m = values["normal"]
+                out["normal"][hits] = normalise(t * m[:, 0:1] + b * m[:, 1:2] + n * m[:, 2:3])
+        return out
+
+
+def load_pbr(path: Path, overrides: dict[str, Path | None], log=print) -> PbrSource:
+    """A high-res PBR model from glTF/GLB, OBJ + MTL, or PLY/STL with maps given in `overrides`
+    (base_color, roughness, metallic, normal, occlusion), which also replace the file's own maps."""
+    import trimesh
+    suffix = path.suffix.lower()
+    if suffix == ".fbx":
+        raise SystemExit("FBX models need converting to glTF or OBJ for the PBR bake")
+    if suffix == ".obj":
+        positions, faces, corner_uv, corner_normals, face_material, names, libraries = read_obj(path, details=True)
+        materials = read_mtl(libraries, path.parent, names, log)
+    else:
+        loaded = trimesh.load(str(path), process=False)
+        meshes = loaded.dump(concatenate=False) if isinstance(loaded, trimesh.Scene) else [loaded]
+        meshes = [m for m in meshes if isinstance(m, trimesh.Trimesh) and len(m.faces)]
+        parts, materials, known = [], [], {}
+        offset = 0
+        for mesh in meshes:
+            mesh_faces = np.asarray(mesh.faces, np.int64)
+            uv = getattr(mesh.visual, "uv", None)
+            uv = np.zeros((len(mesh.vertices), 2)) if uv is None or len(uv) != len(mesh.vertices) else np.asarray(uv, np.float64)
+            source = getattr(mesh.visual, "material", None)
+            if id(source) not in known:
+                known[id(source)] = len(materials)
+                materials.append(_gltf_material(source))
+            parts.append((np.asarray(mesh.vertices, np.float64), mesh_faces + offset, uv[mesh_faces],
+                          np.asarray(mesh.vertex_normals, np.float64)[mesh_faces], np.full(len(mesh_faces), known[id(source)])))
+            offset += len(mesh.vertices)
+        if not parts:
+            raise SystemExit("The file contains no meshes")
+        positions, faces, corner_uv, corner_normals, face_material = (np.concatenate(p) for p in zip(*parts))
+    if not len(faces):
+        raise SystemExit("The file contains no meshes")
+    if not materials:
+        materials = [Material()]
+    if corner_uv is None:
+        if any(overrides.values()) or any(image is not None for m in materials for image in m.images.values()):
+            raise SystemExit("The model has no UVs, so its textures cannot be transferred")
+        corner_uv = np.zeros((len(faces), 3, 2))
+    for key, file in overrides.items():
+        if file:
+            image = read_map(Path(file), srgb=key == "base_color")
+            for material in materials:
+                if key == "normal":
+                    material.images["normal"] = image
+                else:
+                    material.set_map(key, image, channel=None if key == "base_color" else 0)
+    for material in materials:
+        present = [key for key, image in material.images.items() if image is not None]
+        log(f"  material {material.name or '(unnamed)'}: {', '.join(present) or 'constants only'}")
+    return PbrSource(positions, faces, corner_uv, corner_normals, face_material, materials)
+
+
 def hemisphere(normals: np.ndarray, u1: np.ndarray, u2: np.ndarray) -> np.ndarray:
     """Cosine-weighted directions around each normal (Frisvad's orthonormal basis)."""
     radius, angle = np.sqrt(u1), 2 * np.pi * u2
@@ -386,12 +663,18 @@ def hemisphere(normals: np.ndarray, u1: np.ndarray, u2: np.ndarray) -> np.ndarra
     return tangent * x[:, None] + bitangent * y[:, None] + normals * z[:, None]
 
 
-def bake(high, low, photo, resolution: int, cage: float, max_ray: float, ao_samples: int, log=print) -> dict:
+def bake(high, low, photo, resolution: int, cage: float, max_ray: float, ao_samples: int, log=print,
+         pbr: PbrSource | None = None) -> dict:
+    """Scan bake: `high` is (positions, faces, corner UVs) and `photo` the scan's texture. PBR bake:
+    `pbr` is the model; its maps are sampled at each hit instead of the photo (into 'lit', plus
+    'roughness' and 'metallic'), its normal maps go into the normals and its occlusion into the AO."""
+    if pbr is not None:
+        high = pbr.positions, pbr.faces, pbr.corner_uv
     high_pos, high_faces, high_uv = high
     positions, loop_verts, loop_uv, tri_loops = low
     tracer = Tracer(high_pos, high_faces)
     diagonal = float(np.linalg.norm(high_pos.max(axis=0) - high_pos.min(axis=0)))
-    high_normals = vertex_normals(high_pos, high_faces)
+    high_normals = vertex_normals(high_pos, high_faces) if pbr is None else None
     low_faces = loop_verts[tri_loops]
     loop_normals = vertex_normals(positions, low_faces)[loop_verts]
     loop_t, loop_sign = loop_tangents(positions, loop_verts, loop_uv, tri_loops, loop_normals)
@@ -442,13 +725,20 @@ def bake(high, low, photo, resolution: int, cage: float, max_ray: float, ao_samp
     hit_weights = np.stack([1 - hu - hv, hu, hv], axis=1).astype(np.float64)
     corners = high_faces[prim]
     hit_point = np.einsum("nk,nkc->nc", hit_weights, high_pos[corners])
-    hit_normal = normalise(np.einsum("nk,nkc->nc", hit_weights, high_normals[corners]))
-    hit_uv = np.einsum("nk,nkc->nc", hit_weights, high_uv[prim])
-
-    lit = sample_photo(photo, hit_uv.astype(np.float32))
-    normal_ts = np.stack([np.sum(hit_normal * tangent, axis=1), np.sum(hit_normal * bitangent, axis=1),
-                          np.sum(hit_normal * normal, axis=1)], axis=1)
-    normal_os = hit_normal
+    extra = {}
+    if pbr is None:
+        hit_normal = normalise(np.einsum("nk,nkc->nc", hit_weights, high_normals[corners]))
+        hit_uv = np.einsum("nk,nkc->nc", hit_weights, high_uv[prim])
+        lit = sample_photo(photo, hit_uv.astype(np.float32))
+        detail = hit_normal
+    else:
+        hit_normal = pbr.normal_at(prim, hit_weights)
+        values = pbr.sample(prim, hit_weights, hit_normal)
+        lit, detail = values["base_color"], values["normal"]
+        extra = {key: values[key] for key in ("roughness", "metallic")}
+    normal_ts = np.stack([np.sum(detail * tangent, axis=1), np.sum(detail * bitangent, axis=1),
+                          np.sum(detail * normal, axis=1)], axis=1)
+    normal_os = detail
 
     # Ambient occlusion of the high-res surface; occluder distance as the Blender stage (10% of the diagonal).
     face = high_pos[corners]
@@ -465,6 +755,8 @@ def bake(high, low, photo, resolution: int, cage: float, max_ray: float, ao_samp
         direction[below] -= 2 * np.sum(direction[below] * geometric[below], axis=1, keepdims=True) * geometric[below]
         open_sky += ~tracer.occluded(origin, direction, reach)
     ao = open_sky / max(ao_samples, 1)
+    if pbr is not None:
+        ao = ao * values["occlusion"][:, 0]  # the model's own occlusion map on top of the baked AO
 
     def image(values):
         out = np.zeros((resolution, resolution, values.shape[1]), np.float32)
@@ -472,7 +764,8 @@ def bake(high, low, photo, resolution: int, cage: float, max_ray: float, ao_samp
         return out
 
     return {"lit": image(lit), "normal_ts": image(normal_ts * 0.5 + 0.5), "normal_os": image(normal_os),
-            "ao": image(ao[:, None]), "coverage": (rows, cols), "misses": int(miss.sum())}
+            "ao": image(ao[:, None]), **{key: image(value) for key, value in extra.items()},
+            "coverage": (rows, cols), "misses": int(miss.sum())}
 
 
 def write_exr(path: Path, rgb: np.ndarray) -> None:
@@ -523,13 +816,19 @@ def layout(low_mesh: Path, scan: Path, out: Path, resolution: int, margin: int, 
 
 
 def bake_layout(scan: Path, texture: Path | None, out: Path, cage: float, max_ray: float, ao_samples: int,
-                topology: str = "tri", log=print) -> dict:
-    """Bake stage: project the scan onto the unwrapped low mesh from layout.npz."""
+                topology: str = "tri", log=print, source: str = "scan", maps: dict | None = None) -> dict:
+    """Bake stage: project the scan (source="scan") or a PBR model (source="pbr", `maps` overriding
+    its material's maps) onto the unwrapped low mesh from layout.npz."""
     saved = np.load(out / "layout.npz")
     positions, sizes, loop_verts, loop_uv = saved["positions"], saved["sizes"], saved["loop_verts"], saved["loop_uv"]
     resolution, unwrap_info = int(saved["resolution"]), json.loads(str(saved["info"]))
     margin = int(saved["margin"])
     tri_loops, _ = fan(sizes)
+    if source == "pbr":
+        model = load_pbr(scan, {"base_color": texture, **(maps or {})}, log)
+        return _bake_and_write(scan, out, model.positions, model.faces, model.corner_uv, None, positions, sizes, loop_verts,
+                               loop_uv, tri_loops, unwrap_info, resolution, margin, cage, max_ray, ao_samples, topology,
+                               log, pbr=model)
     raw_pos, raw_faces, corner_uv, photo = load_scan(scan, texture)
     high_pos, high_faces, _ = weld(raw_pos, raw_faces)
     return _bake_and_write(scan, out, high_pos, high_faces, corner_uv, photo, positions, sizes, loop_verts, loop_uv,
@@ -554,24 +853,25 @@ def prep(scan: Path, texture: Path | None, out: Path, faces: int, resolution: in
 
 
 def _bake_and_write(scan, out, high_pos, high_faces, corner_uv, photo, positions, sizes, loop_verts, loop_uv, tri_loops,
-                    unwrap_info, resolution, margin, cage, max_ray, ao_samples, topology, log) -> dict:
+                    unwrap_info, resolution, margin, cage, max_ray, ao_samples, topology, log, pbr=None) -> dict:
     source_faces = len(high_faces)
     axes = TO_BLENDER if scan.suffix.lower() in Y_UP else np.eye(3)
     maps = bake((high_pos, high_faces, corner_uv), (positions, loop_verts, loop_uv, tri_loops), photo,
-                resolution, cage, max_ray, ao_samples, log=log)
+                resolution, cage, max_ray, ao_samples, log=log, pbr=pbr)
     maps["normal_os"] = maps["normal_os"] @ axes.T * 0.5 + 0.5
     rows, cols = maps["coverage"]
     empty = np.ones((resolution, resolution), bool)
     empty[rows, cols] = False
     maps["normal_os"][empty] = 0
-    for name in ("lit", "normal_ts", "normal_os", "ao"):  # extend into the gutter, like Blender's bake margin
+    names = ("lit", "normal_ts", "normal_os", "ao") + (("roughness", "metallic") if pbr is not None else ())
+    for name in names:  # extend into the gutter, like Blender's bake margin
         write_exr(out / f"{name}.exr", fill_gutter(maps[name], ~empty, margin))
 
     uv_tris = loop_uv[tri_loops].astype(np.float32)
     np.save(out / "uv_tris.npy", uv_tris)
     np.savez(out / "low.npz", positions=positions, sizes=sizes, loop_verts=loop_verts, loop_uv=loop_uv,
              axes=axes, y_up=scan.suffix.lower() in Y_UP)
-    info = {"input": str(scan), "topology": topology, "source_faces": int(source_faces), "faces": int(len(sizes)),
+    info = {"input": str(scan), "source": "pbr" if pbr is not None else "scan", "topology": topology, "source_faces": int(source_faces), "faces": int(len(sizes)),
             "quads": int((sizes == 4).sum()), "triangles": int(len(tri_loops)), "resolution": resolution,
             "device": "CPU (Embree)", "backend": "native", **unwrap_info,
             "uv_coverage": round(float(np.abs(triangle_areas(uv_tris)).sum()), 4), "bake_misses": maps["misses"]}
@@ -579,9 +879,10 @@ def _bake_and_write(scan, out, high_pos, high_faces, corner_uv, photo, positions
     return info
 
 
-def assemble(work: Path, glb: Path, name: str) -> None:
+def assemble(work: Path, glb: Path, name: str, metallic: bool = False) -> None:
     """glTF binary with the PBR material, and an OBJ + MTL that keeps quads (for DCC tools and
-    the app's preview). Both in Y-up glTF/OBJ axes, as Blender exports them."""
+    the app's preview). Both in Y-up glTF/OBJ axes, as Blender exports them. metallic: use
+    work/metallic.png (PBR bakes); scans are dielectric."""
     import trimesh
     from PIL import Image
     low = np.load(work / "low.npz")
@@ -597,10 +898,12 @@ def assemble(work: Path, glb: Path, name: str) -> None:
     albedo = Image.open(work / "albedo.png").convert("RGB")
     roughness = np.asarray(Image.open(work / "roughness.png").convert("L"))
     ao = np.asarray(Image.open(work / "ao8.png").convert("L"))
-    orm = Image.fromarray(np.stack([ao, roughness, np.zeros_like(ao)], axis=2))  # glTF: R occlusion, G roughness, B metallic
+    metal = np.asarray(Image.open(work / "metallic.png").convert("L")) if metallic else np.zeros_like(ao)
+    orm = Image.fromarray(np.stack([ao, roughness, metal], axis=2))  # glTF: R occlusion, G roughness, B metallic
     material = trimesh.visual.material.PBRMaterial(
         name=f"{name}_pbr", baseColorTexture=albedo, metallicRoughnessTexture=orm, occlusionTexture=orm,
-        normalTexture=Image.open(work / "normal.png").convert("RGB"), metallicFactor=0.0, roughnessFactor=1.0)
+        normalTexture=Image.open(work / "normal.png").convert("RGB"), metallicFactor=1.0 if metallic else 0.0,
+        roughnessFactor=1.0)
     mesh = trimesh.Trimesh(vertices=positions[loop_verts[first]], faces=vertex[tri_loops],
                            vertex_normals=loop_normals[first], process=False,
                            visual=trimesh.visual.TextureVisuals(uv=loop_uv[first], material=material))
@@ -623,7 +926,8 @@ def assemble(work: Path, glb: Path, name: str) -> None:
     textures = f"textures/{name}"
     obj.with_suffix(".mtl").write_text(
         f"newmtl {name}_pbr\nKd 1 1 1\nKs 0 0 0\nmap_Kd {textures}_albedo.png\nmap_Bump -bm 1 {textures}_normal_gl.png\n"
-        f"Pr 1\nmap_Pr {textures}_roughness.png\n", encoding="ascii")
+        f"Pr 1\nmap_Pr {textures}_roughness.png\n" + (f"Pm 1\nmap_Pm {textures}_metallic.png\n" if metallic else ""),
+        encoding="ascii")
 
 
 if __name__ == "__main__":

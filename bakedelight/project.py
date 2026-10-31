@@ -39,7 +39,7 @@ SCHEMA = {
         "tiled": True, "tile_size": 0, "tile_overlap": 0.25, "bit_depth": 8, "apply_mask": True,
     },
     "scan": {
-        "scan": "", "photo": "", "out": "",
+        "scan": "", "photo": "", "out": "", "source": "scan",
         "remesher": "decimate", "faces": 10000, "sharp": False,
         "unwrap": "xatlas", "smart_angle": 66.0, "margin": 16,
         "backend": "auto", "resolution": 2048, "ao_samples": 64, "cage": 0.01, "max_ray": 0.03,
@@ -53,6 +53,7 @@ PATH_KEYS = {
 CHOICES = {
     ("delight", "bit_depth"): [8, 16],
     ("delight", "tile_size"): [0, 512, 1024, 2048, 4096],
+    ("scan", "source"): ["scan", "pbr"],
     ("scan", "remesher"): ["decimate", "autoremesher", "quadwild"],
     ("scan", "unwrap"): ["xatlas", "smart"],
     ("scan", "backend"): ["auto", "blender", "native"],
@@ -74,8 +75,9 @@ DESCRIPTIONS = {
     ("delight", "bit_depth"): "output PNG bit depth",
     ("delight", "apply_mask"): "black out texels outside the UV islands",
     ("scan", "scan"): "high-res scan: OBJ, PLY, FBX, GLB/glTF, STL",
-    ("scan", "photo"): "photo texture; empty = taken from the scan's material",
+    ("scan", "photo"): "photo texture (base colour for pbr); empty = taken from the material",
     ("scan", "out"): "output folder; empty = <scan>_optimized next to the scan",
+    ("scan", "source"): "scan: photo scan, de-lit; pbr: model with PBR materials, baked as they are",
     ("scan", "remesher"): "decimate (triangles), autoremesher or quadwild (quads)",
     ("scan", "faces"): "target face count",
     ("scan", "sharp"): "quads: keep sharp feature edges (hard-surface scans)",

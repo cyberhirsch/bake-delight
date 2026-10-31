@@ -55,7 +55,7 @@ DEFAULTS = {
     "onnx_model": "", "force_cpu": False, "tiled": True, "tile_size": "auto", "tile_overlap": 0.25,
     "bit_depth": "8", "apply_mask": True, "output_name": "delighted_albedo.png", "show_after_run": True,
     # scan optimiser
-    "scan": "", "photo": "", "scan_out": "", "remesher": next(iter(REMESHERS)), "faces": "10000",
+    "scan": "", "photo": "", "scan_out": "", "source": "scan", "remesher": next(iter(REMESHERS)), "faces": "10000",
     "resolution": "2048", "backend": "auto", "unwrap": "xatlas", "smart_angle": 66.0, "margin": "16", "ao_samples": "64",
     "cage": 0.01, "max_ray": 0.03, "roughness": 0.8, "roughness_variation": 0.25,
     "predecimate": 2.0, "sharp": False, "scan_tiled": False, "keep_work": False,
@@ -73,7 +73,7 @@ DEFAULTS = {
 PROJECT_KEYS = {
     **{key: f"delight.{key}" for key in ("model", "lit", "normal", "ao", "mask", "output_dir", "output_name", "onnx_model",
                                          "force_cpu", "tiled", "tile_size", "tile_overlap", "bit_depth", "apply_mask")},
-    **{key: f"scan.{key}" for key in ("scan", "photo", "remesher", "faces", "resolution", "backend", "unwrap", "smart_angle",
+    **{key: f"scan.{key}" for key in ("scan", "photo", "source", "remesher", "faces", "resolution", "backend", "unwrap", "smart_angle",
                                       "margin", "ao_samples", "cage", "max_ray", "roughness", "roughness_variation",
                                       "predecimate", "sharp", "keep_work")},
     "scan_out": "scan.out", "scan_tiled": "scan.tiled",
@@ -581,10 +581,12 @@ class DelighterGUI(TuiWidgets):
             return frame
         self._row(tab, "", project_buttons, hint=f"{PROJECT_SUFFIX}: inputs, settings, results")
         self._section(tab, "scan")
+        self._row(tab, "SOURCE", lambda parent: self._segmented(parent, self.var["source"], ["scan", "pbr"]),
+                  hint="scan: de-lit photo · pbr: maps kept as they are")
         self._path_row(tab, "HIGH-RES SCAN", "scan", filetypes=[("Meshes", "*.obj *.ply *.fbx *.glb *.gltf *.stl")],
                        on_change=self._on_scan_chosen)
         self._path_row(tab, "PHOTO TEXTURE", "photo", filetypes=[("Images", "*.png *.jpg *.jpeg *.tif *.tiff *.exr")])
-        self._label(tab, "│   empty = taken from the scan's material", color=HINT, size=11).grid(
+        self._label(tab, "│   empty = taken from the material · pbr: base colour override", color=HINT, size=11).grid(
             row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
         tab.next_row += 1
         self._section(tab, "low-res mesh")
@@ -1021,7 +1023,7 @@ class DelighterGUI(TuiWidgets):
         out = self._scan_out()
         photo = self.var["photo"].get().strip()
         remesher = self.var["remesher"].get()
-        command = [self._scanopt_python(), "-u", SCANOPT_SCRIPT, scan, "--out", out, "--faces", str(faces),
+        command = [self._scanopt_python(), "-u", SCANOPT_SCRIPT, scan, "--out", out, "--source", self.var["source"].get(), "--faces", str(faces),
                    "--remesher", REMESHERS[remesher], "--resolution", self.var["resolution"].get(),
                    "--backend", self.var["backend"].get(),
                    "--unwrap", self.var["unwrap"].get(), "--smart-angle", f"{self._value('smart_angle', float):.1f}",

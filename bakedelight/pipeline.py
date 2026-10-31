@@ -100,7 +100,7 @@ def scan_command(project: Project, machine: dict | None = None) -> tuple[list[st
     scan = Path(s["scan"])
     out = Path(s["out"]) if s["out"] else scan.with_name(scan.stem + "_optimized")
     command = [scanopt_python(machine), "-u", str(SCANOPT_SCRIPT), str(scan), "--out", str(out),
-               "--faces", str(s["faces"]), "--remesher", s["remesher"], "--resolution", str(s["resolution"]),
+               "--source", s["source"], "--faces", str(s["faces"]), "--remesher", s["remesher"], "--resolution", str(s["resolution"]),
                "--backend", s["backend"], "--unwrap", s["unwrap"], "--smart-angle", f"{s['smart_angle']:.1f}",
                "--margin", str(s["margin"]), "--ao-samples", str(s["ao_samples"]),
                "--cage", f"{s['cage']:.4f}", "--max-ray", f"{s['max_ray']:.4f}",
