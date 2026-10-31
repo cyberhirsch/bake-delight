@@ -44,7 +44,7 @@ TABS = {"import": "1 IMPORT", "remesh": "2 REMESH", "uv": "3 UV", "bake": "4 BAK
 STAGE_OF_TAB = {TABS[stage]: stage for stage in ("remesh", "uv", "bake", "delight", "export")}
 # Original scans above this size are not parsed for the before view; the baked photo is used instead.
 MAX_BEFORE_SCAN_BYTES = 2 * 1024 * 1024 * 1024  # an 880 MB OBJ (8 M triangles) loads in about 35 s
-BACKGROUNDS = {"Void": (0.0, 0.0, 0.0), "Charcoal": (0.04, 0.04, 0.04), "Graphite": (0.16, 0.16, 0.16),
+BACKGROUNDS = {"Void": (0.0, 0.0, 0.0), "Charcoal": (0.07, 0.07, 0.07), "Graphite": (0.16, 0.16, 0.16),
                "Mid grey": (0.42, 0.42, 0.42), "Paper": (0.86, 0.86, 0.86)}
 
 # Every persisted setting: key -> default. The type of the default picks the Tk variable.
@@ -355,12 +355,12 @@ class DelighterGUI(TuiWidgets):
             entry.drop_target_register(DND_FILES)
             entry.dnd_bind("<<Drop>>", lambda event: self._drop_path(event, key, on_change))
             ctk.CTkButton(frame, text="…", width=28, height=26, corner_radius=0, border_width=1, border_color=BORDER,
-                          fg_color=FIELD, hover_color="#1a1a1a", text_color=TEXT, font=self._font(12),
+                          fg_color=FIELD, hover_color="#2a2a2a", text_color=TEXT, font=self._font(12),
                           command=lambda: self._browse(key, kind, filetypes, on_change)).grid(row=0, column=1, padx=(4, 0))
             for column, (text, command) in enumerate((("↻", lambda: self._reload_path(key, on_change)),
                                                       ("×", lambda: self._clear_path(key, on_change))), start=2):
                 ctk.CTkButton(frame, text=text, width=28, height=26, corner_radius=0, border_width=1, border_color=BORDER,
-                              fg_color=FIELD, hover_color="#1a1a1a", text_color=TEXT, font=self._font(12),
+                              fg_color=FIELD, hover_color="#2a2a2a", text_color=TEXT, font=self._font(12),
                               command=command).grid(row=0, column=column, padx=(4, 0))
             for column, (text, command) in enumerate(extra, start=4):
                 self._button(frame, text, command).grid(row=0, column=column, padx=(4, 0))
@@ -1116,12 +1116,12 @@ class DelighterGUI(TuiWidgets):
         """The low mesh's UV charts on the unit square: filled triangles with light edges."""
         from PIL import ImageDraw
         uv = load_obj(obj_path).vertex_data[:, 3:5].reshape(-1, 3, 2)
-        image = Image.new("RGB", (size, size), (10, 10, 10))
+        image = Image.new("RGB", (size, size), (24, 24, 24))
         draw = ImageDraw.Draw(image)
         draw.rectangle((0, 0, size - 1, size - 1), outline=(60, 60, 60))
         points = np.column_stack([uv[..., 0].ravel() * (size - 1), (1 - uv[..., 1].ravel()) * (size - 1)]).reshape(-1, 3, 2)
         for triangle in points:
-            draw.polygon([tuple(corner) for corner in triangle], fill=(34, 34, 34), outline=(150, 150, 150))
+            draw.polygon([tuple(corner) for corner in triangle], fill=(46, 46, 46), outline=(150, 150, 150))
         return image
 
     def _draw_uv_panel(self):

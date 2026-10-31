@@ -11,17 +11,17 @@ import customtkinter as ctk
 from PIL import Image
 
 # TUI palette: greyscale only. State is shown by brightness and by markers (●, !!), never by hue.
-BG = "#000000"
-PANEL = "#060606"
-FIELD = "#0d0d0d"
-BORDER = "#262626"
+BG = "#121212"
+PANEL = "#171717"
+FIELD = "#1e1e1e"
+BORDER = "#303030"
 BORDER_HI = "#555555"
 HINT = "#4a4a4a"
 TEXT = "#c8c8c8"
 TEXT_HI = "#ffffff"
 DIM = "#6e6e6e"
 ACCENT = "#ffffff"       # primary buttons, section rules, active marks
-ACCENT_DIM = "#2e2e2e"   # selected segment, slider fill
+ACCENT_DIM = "#3a3a3a"   # selected segment, slider fill
 WARN = "#9a9a9a"
 ERROR = "#ffffff"        # errors read by their "!!" / FAILED text, in full white
 
@@ -96,7 +96,7 @@ class TuiWidgets:
 
     def _option(self, parent, variable, values, width=0, command=None):
         return ctk.CTkOptionMenu(parent, variable=variable, values=values, corner_radius=0, height=26, width=width or 140,
-                                 fg_color=FIELD, button_color="#1a1a1a", button_hover_color="#262626", text_color=TEXT,
+                                 fg_color=FIELD, button_color="#2a2a2a", button_hover_color="#363636", text_color=TEXT,
                                  dropdown_fg_color=FIELD, dropdown_text_color=TEXT, dropdown_hover_color=ACCENT_DIM,
                                  font=self._font(12), dropdown_font=self._font(12), command=command)
 
@@ -108,7 +108,7 @@ class TuiWidgets:
     def _segmented(self, parent, variable, values, command=None):
         return ctk.CTkSegmentedButton(parent, variable=variable, values=values, corner_radius=0, height=26, border_width=1,
                                       fg_color=BORDER, selected_color=ACCENT_DIM, selected_hover_color="#333333",
-                                      unselected_color=FIELD, unselected_hover_color="#161616", text_color=TEXT,
+                                      unselected_color=FIELD, unselected_hover_color="#2a2a2a", text_color=TEXT,
                                       font=self._font(12), command=command)
 
     # ---------------------------------------------------------------- sidebar rows

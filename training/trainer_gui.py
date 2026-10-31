@@ -463,7 +463,7 @@ class TrainerGUI(TuiWidgets):
         else:
             self.status_label.configure(text="○ IDLE", text_color=DIM)
         # a disabled primary button keeps its white fill unless told otherwise
-        self.start_button.configure(state="disabled" if running else "normal", fg_color="#1a1a1a" if running else ACCENT,
+        self.start_button.configure(state="disabled" if running else "normal", fg_color="#2a2a2a" if running else ACCENT,
                                     border_color=BORDER if running else ACCENT)
         self.stop_button.configure(state="normal" if mine else "disabled")
         self.action_hint.configure(text="one pipeline at a time: the GPU is shared" if running and not mine else
@@ -568,7 +568,7 @@ class TrainerGUI(TuiWidgets):
         for i in range(5):
             level = low + (high - low) * i / 4
             y = bottom - (bottom - top) * i / 4
-            canvas.create_line(left, y, right, y, fill="#161616")
+            canvas.create_line(left, y, right, y, fill="#222222")
             label = 10 ** level if logarithmic else level
             canvas.create_text(left - 6, y, text=f"{label:.3f}", fill=HINT, anchor="e", font=small)
         for i in range(5):

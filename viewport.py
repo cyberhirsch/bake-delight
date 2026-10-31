@@ -147,7 +147,7 @@ class Camera:
         self.checker = False         # procedural UV checker instead of the texture
         self.checker_cells = 32
         self.texture_filter = "mipmap"  # "mipmap", "linear" or "nearest"
-        self.background = (0.04, 0.04, 0.04)
+        self.background = (0.07, 0.07, 0.07)
         self.orbit_speed = 0.5       # degrees per pixel dragged
         self.zoom_step = 1.14
         self.reset()
@@ -256,7 +256,7 @@ class TextureViewport(OpenGLFrame):
         self.bind("<Button-5>", lambda event: self._zoom(1))
 
     def initgl(self):
-        GL.glClearColor(0.04, 0.04, 0.04, 1.0)
+        GL.glClearColor(0.07, 0.07, 0.07, 1.0)
         GL.glEnable(GL.GL_DEPTH_TEST)
         self.program = shaders.compileProgram(
             shaders.compileShader(self.VERTEX_SHADER, GL.GL_VERTEX_SHADER),
