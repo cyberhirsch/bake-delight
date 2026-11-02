@@ -14,6 +14,8 @@ import numpy as np
 from PIL import Image
 
 try:
+    import OpenGL
+    OpenGL.ERROR_CHECKING = False  # a glGetError after every call; most of the time of a redraw
     from OpenGL import GL
     from OpenGL.GL import shaders
     from pyopengltk import OpenGLFrame
@@ -242,6 +244,7 @@ class TextureViewport(OpenGLFrame):
         self.split = 0.5           # wipe position, fraction of the width from the left
         self._drag_start = None
         self._dragging_split = False
+        self._redraw_job = None
         # Left: orbit (or move the wipe line) · middle: pan · right: zoom · wheel: zoom.
         self.bind("<ButtonPress-1>", self._begin_drag)
         self.bind("<B1-Motion>", self._drag)
@@ -387,6 +390,12 @@ class TextureViewport(OpenGLFrame):
     # ------------------------------------------------------------ drawing
 
     def redraw(self):
+        """Draw once the current events are handled: a tab switch asks for about eight redraws."""
+        if self._redraw_job is None:
+            self._redraw_job = self.after_idle(self._render)
+
+    def _render(self):
+        self._redraw_job = None
         if not self.winfo_exists() or not self.program or not self.winfo_ismapped():
             return
         self.tkMakeCurrent()  # several viewports means several GL contexts

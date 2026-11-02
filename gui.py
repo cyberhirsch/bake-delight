@@ -18,7 +18,7 @@ from bakedelight import models
 from bakedelight.project import SUFFIX as PROJECT_SUFFIX, Project, ProjectError
 from engine import DelighterInferenceEngine
 from tui import (ACCENT, ACCENT_DIM, BG, BORDER, BORDER_HI, DIM, ERROR, FIELD, HINT, PANEL, TEXT, TEXT_HI,  # noqa: F401
-                 WARN, TuiWidgets)
+                 WARN, Button, ScrollPanel, TuiWidgets, background_of)
 try:
     from viewport import OPENGL_AVAILABLE, Camera, TextureViewport, forget, load_obj
 except Exception:
@@ -348,20 +348,17 @@ class DelighterGUI(TuiWidgets):
 
     def _path_row(self, tab, label, key, kind="file", filetypes=None, on_change=None, extra=()):
         def build(parent):
-            frame = ctk.CTkFrame(parent, fg_color="transparent")
+            frame = tk.Frame(parent, bg=background_of(parent), bd=0, highlightthickness=0)
             frame.grid_columnconfigure(0, weight=1)
             entry = self._entry(frame, self.var[key])
             entry.grid(row=0, column=0, sticky="ew")
             entry.drop_target_register(DND_FILES)
             entry.dnd_bind("<<Drop>>", lambda event: self._drop_path(event, key, on_change))
-            ctk.CTkButton(frame, text="…", width=28, height=26, corner_radius=0, border_width=1, border_color=BORDER,
-                          fg_color=FIELD, hover_color="#2a2a2a", text_color=TEXT, font=self._font(12),
-                          command=lambda: self._browse(key, kind, filetypes, on_change)).grid(row=0, column=1, padx=(4, 0))
-            for column, (text, command) in enumerate((("↻", lambda: self._reload_path(key, on_change)),
-                                                      ("×", lambda: self._clear_path(key, on_change))), start=2):
-                ctk.CTkButton(frame, text=text, width=28, height=26, corner_radius=0, border_width=1, border_color=BORDER,
-                              fg_color=FIELD, hover_color="#2a2a2a", text_color=TEXT, font=self._font(12),
-                              command=command).grid(row=0, column=column, padx=(4, 0))
+            for column, (text, command) in enumerate((("…", lambda: self._browse(key, kind, filetypes, on_change)),
+                                                      ("↻", lambda: self._reload_path(key, on_change)),
+                                                      ("×", lambda: self._clear_path(key, on_change))), start=1):
+                Button(frame, text=text, width=28, fg_color=FIELD, hover_color="#2a2a2a", font=self._tk_font(12),
+                       command=command).grid(row=0, column=column, padx=(4, 0))
             for column, (text, command) in enumerate(extra, start=4):
                 self._button(frame, text, command).grid(row=0, column=column, padx=(4, 0))
             return frame
@@ -454,7 +451,7 @@ class DelighterGUI(TuiWidgets):
         header.grid_columnconfigure(1, weight=1)
         self._label(header, "┌─ VIEWPORT", color=ACCENT, size=12, weight="bold").grid(row=0, column=0, padx=(0, 10))
         # Fixed width: hint length differs per view mode and would otherwise resize the panels.
-        self.view_hint = self._label(header, "", color=DIM, size=11, width=320)
+        self.view_hint = self._label(header, "", color=DIM, size=11, width=360)
         self.view_hint.grid(row=0, column=1, sticky="w")
         self._segmented(header, self.var["view_mode"], VIEW_MODES, command=lambda _value: self._apply_view_mode()).grid(
             row=0, column=2, padx=(0, 8))
@@ -517,14 +514,14 @@ class DelighterGUI(TuiWidgets):
         self._segmented(side, self.tab_var, tabs, command=lambda _value: self._show_tab()).grid(
             row=0, column=0, sticky="ew", padx=8, pady=8)
 
-        self.tabs = {}
+        self.tabs, self._tab_panels = {}, {}
         for name in tabs:
-            tab = ctk.CTkScrollableFrame(side, fg_color=PANEL, corner_radius=0, scrollbar_button_color=BORDER,
-                                         scrollbar_button_hover_color=BORDER_HI)
+            panel = ScrollPanel(side)
+            panel.grid(row=1, column=0, sticky="nsew", padx=2)
+            tab = panel.content
             tab.grid_columnconfigure(1, weight=1)
             tab.next_row = 0
-            tab.grid(row=1, column=0, sticky="nsew", padx=2)
-            self.tabs[name] = tab
+            self.tabs[name], self._tab_panels[name] = tab, panel
         for key, build in (("import", self._build_input_tab), ("remesh", self._build_remesh_tab), ("uv", self._build_uv_tab),
                            ("bake", self._build_bake_tab), ("delight", self._build_delight_tab),
                            ("export", self._build_export_tab), ("view", self._build_view_tab), ("sys", self._build_sys_tab)):
@@ -546,9 +543,13 @@ class DelighterGUI(TuiWidgets):
         self._show_tab()
 
     def _show_tab(self):
-        # All tabs stay laid out in one cell; raising one is instant, while unmapping and
-        # remapping a tab full of CustomTkinter widgets took 60-600 ms per switch.
-        self.tabs[self.tab_var.get()]._parent_frame.tkraise()
+        # Only the shown tab is mapped. Keeping all eight mapped and raising one made Windows
+        # repaint about 900 widgets on every window resize.
+        for name, panel in self._tab_panels.items():
+            if name == self.tab_var.get():
+                panel.grid()
+            else:
+                panel.grid_remove()
         self._refresh_run_buttons()
         if getattr(self, "viewport", None):  # the view follows the tab: UV layout on 3 UV, high | low elsewhere
             self._apply_view_settings()
@@ -720,7 +721,7 @@ class DelighterGUI(TuiWidgets):
         tab.next_row += 1
         self._section(tab, "interface")
         self._slider_row(tab, "UI SCALE", "ui_scale", 0.6, 1.4, 16, fmt="{:.2f}")
-        self._row(tab, "", lambda parent: self._button(parent, "apply scale", lambda: ctk.set_widget_scaling(self._value("ui_scale", float))))
+        self._row(tab, "", lambda parent: self._button(parent, "apply scale", lambda: self._apply_ui_scale(self._value("ui_scale", float))))
         self._row(tab, "LOG LINES", lambda parent: self._entry(parent, self.var["log_lines"], width=90))
         self._row(tab, "", lambda parent: self._button(parent, "clear log", self._clear_log))
         self._section(tab, "settings")
