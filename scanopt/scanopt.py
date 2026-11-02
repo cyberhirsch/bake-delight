@@ -96,6 +96,7 @@ def main() -> int:
     parser.add_argument("--cage", type=float, default=0.01, help="bake ray start offset, fraction of the bounds diagonal")
     parser.add_argument("--max-ray", type=float, default=0.03, help="bake ray search distance, fraction of the bounds diagonal")
     parser.add_argument("--tiled", action="store_true", help="de-light in overlapping tiles (less VRAM)")
+    parser.add_argument("--tile-size", type=int, default=0, help="tile size in px with --tiled; 0 = half the image")
     parser.add_argument("--predecimate", type=float, default=2.0,
                         help="quad mode: decimate the scan to this many times --faces before quad remeshing (0 = off)")
     parser.add_argument("--sharp", action="store_true", help="quad mode: keep sharp feature edges (hard-surface scans)")
@@ -146,6 +147,7 @@ def main() -> int:
                 else:
                     import autoremesher as backend
                     tool_dir = args.autoremesher
+                native_stage.progress(0.35)  # the remesher itself reports nothing until it is done
                 quad_mesh, quad_report = backend.remesh(work / "high.obj", args.faces, work / args.remesher,
                                                         tool_dir=tool_dir or backend.DEFAULT_DIR, sharp=args.sharp)
                 shutil.copy(quad_mesh, low)
@@ -153,7 +155,9 @@ def main() -> int:
                 print(f"{tag} reducing to {args.faces} triangles", flush=True)
                 native_stage.reduce_scan(args.input, args.faces, low)
                 quad_report = None
+            native_stage.progress(0.9)
             native_stage.write_preview_obj(low, args.input, work / "low_preview.obj")
+            native_stage.progress(1.0)
             print(f"      low mesh: {low}", flush=True)
             done("remesh", since, remesher=args.remesher, topology="quad" if quads else "tri", quad_remesh=quad_report)
 
@@ -162,6 +166,7 @@ def main() -> int:
             print(f"{tag} unwrapping (xatlas)", flush=True)
             info = native_stage.layout(work / "low.obj", args.input, work, args.resolution, args.margin,
                                        log=lambda text: print(text, flush=True))
+            native_stage.progress(1.0)
             print(f"      uv mesh: {work / 'low_uv.obj'}", flush=True)
             done("uv", since, unwrap="xatlas", resolution=args.resolution, charts=info.get("charts"))
 
@@ -174,6 +179,7 @@ def main() -> int:
                                      topology="quad" if quads else "tri", log=lambda text: print(text, flush=True),
                                      source=args.source, maps={k: v.resolve() for k, v in maps.items() if v})
             write_delight_inputs(work, args.resolution)
+            native_stage.progress(1.0)
             print(f"      maps: {work / 'lit.png'}", flush=True)
             done("bake", since)
 
@@ -192,7 +198,8 @@ def main() -> int:
             from engine import DelighterInferenceEngine  # the app's own inference path
             engine = DelighterInferenceEngine(str(model))
             _, _, device = engine.process_texture(str(work / "lit.png"), str(work / "normal_os.png"), str(work / "ao.png"),
-                                                  str(work / "mask.png"), str(work / "albedo_raw.png"), tiled_mode=args.tiled)
+                                                  str(work / "mask.png"), str(work / "albedo_raw.png"), tiled_mode=args.tiled, tile_size=args.tile_size,
+                                                  progress_callback=native_stage.progress)
             print(f"      albedo: {work / 'albedo_raw.png'}", flush=True)
             done("delight", since, model=str(model), device=device)
 
@@ -200,6 +207,7 @@ def main() -> int:
             need(work / "albedo_raw.png", "delight")
             print(f"{tag} roughness, gutter fill, assembling glTF PBR material", flush=True)
             glb = export(args, work, name)
+            native_stage.progress(1.0)
             done("export", since, glb=str(glb))
             info = json.loads((work / "prep.json").read_text())
             report = {**info, "remesher": args.remesher,
@@ -236,6 +244,7 @@ def export(args, work: Path, name: str) -> Path:
     ao = read_exr(work / "ao.exr")[..., 0]
     albedo = cv2.cvtColor(cv2.imread(str(work / "albedo_raw.png")), cv2.COLOR_BGR2RGB).astype(np.float32) / 255
     write_png8(work / "albedo.png", fill_gutter(albedo, mask))
+    native_stage.progress(0.25)
     write_png8(work / "lit8.png", fill_gutter(to_srgb(lit), mask))  # the photo before de-lighting, for comparison
     write_png8(work / "normal.png", normal_ts)  # already extended into the gutter by the bake
     write_png8(work / "ao8.png", np.clip(ao, 0, 1))
@@ -245,8 +254,10 @@ def export(args, work: Path, name: str) -> Path:
         write_png8(work / "metallic.png", read_exr(work / "metallic.exr")[..., 0])
     else:
         write_png8(work / "roughness.png", fill_gutter(roughness_map(normal_ts, ao, mask, args.roughness, args.roughness_variation)[..., None], mask)[..., 0])
+    native_stage.progress(0.6)
     glb = args.out / f"{name}.glb"
     native_stage.assemble(work, glb, name, metallic=pbr)  # the OBJ keeps quads
+    native_stage.progress(0.9)
     textures = args.out / "textures"
     textures.mkdir(exist_ok=True)
     for source, target in [("albedo.png", "albedo"), ("normal.png", "normal_gl"), ("roughness.png", "roughness"),

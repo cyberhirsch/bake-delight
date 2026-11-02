@@ -79,6 +79,7 @@ class OBJMesh:
         # Positions stay in file units; the viewport frames all its meshes with one transform so a
         # high scan and its low mesh line up as they do in a DCC tool.
         self.center = (points.min(axis=0) + points.max(axis=0)) * 0.5
+        self.diagonal = float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))  # the bake's cage unit
         self.radius = float(np.max(np.linalg.norm(points - self.center, axis=1)))
         if self.radius <= 1e-8:
             raise ValueError("The OBJ has zero-sized geometry.")
@@ -91,6 +92,23 @@ class OBJMesh:
             start = np.arange(0, self.vertex_count, 3, dtype=np.uint32)[:, None]
             self._edges = (start + np.array([0, 1, 1, 2, 2, 0], dtype=np.uint32)).ravel()
         return self._edges
+
+    def cage(self, distance):
+        """Vertex data pushed out along area-weighted smooth normals by `distance`: where the bake's
+        rays start. Corners at the same position share a normal, as the bake's welded mesh does."""
+        if getattr(self, "_smooth_normals", None) is None:
+            points = self.vertex_data[:, :3].astype(np.float64)
+            _, vertex = np.unique(points, axis=0, return_inverse=True)
+            vertex = vertex.ravel()
+            corners = points.reshape(-1, 3, 3)
+            face_normals = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+            normals = np.zeros((vertex.max() + 1, 3))
+            np.add.at(normals, vertex, np.repeat(face_normals, 3, axis=0))
+            normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-20)
+            self._smooth_normals = normals[vertex].astype(np.float32)
+        data = self.vertex_data.copy()
+        data[:, :3] += self._smooth_normals * np.float32(distance)
+        return data
 
     @staticmethod
     def _numbers(lines, columns):
@@ -146,6 +164,9 @@ class Camera:
         self.fov = 50.0
         self.wireframe = False
         self.wire_color = (0.92, 0.92, 0.92, 0.45)
+        self.solid = False           # every mesh grey with its edges, textures or not
+        self.cage = None             # fraction of the high mesh's diagonal: show the bake cage around the low mesh
+        self.cage_color = (0.27, 1.0, 0.27)
         self.checker = False         # procedural UV checker instead of the texture
         self.checker_cells = 32
         self.texture_filter = "mipmap"  # "mipmap", "linear" or "nearest"
@@ -191,7 +212,9 @@ class _Slot:
         self.texture_id = None
         self.uploaded_texture = None
         self.has_mipmaps = False
-        self.shading = None        # None: texture or checker per the camera; "flat": grey with wireframe
+        self.cage_buffer = None
+        self.cage_key = None       # (mesh, distance) the cage buffer holds
+        self.shading = None       # None: texture or checker per the camera; "flat": grey with wireframe
 
     @property
     def triangles(self):
@@ -287,6 +310,8 @@ class TextureViewport(OpenGLFrame):
             stamp = (texture_path, os.path.getmtime(texture_path))
             if stamp != target.texture_path:
                 with Image.open(texture_path) as source:
+                    if source.mode.startswith("I"):  # 16-bit greyscale (the baked AO): to 8 bit, not clipped
+                        source = Image.fromarray((np.asarray(source, dtype=np.float32) / 257).astype(np.uint8), "L")
                     image = source.convert("RGBA").transpose(Image.Transpose.FLIP_TOP_BOTTOM)
                     target.image = (image.width, image.height, image.tobytes())
                 target.texture_path = stamp
@@ -435,12 +460,68 @@ class TextureViewport(OpenGLFrame):
             GL.glDisable(GL.GL_SCISSOR_TEST)
         else:
             self._draw(self.slots[self.mode], transform)
+        if camera.cage is not None and frame is not None:
+            self._draw_cage(self.slots["b"], camera.cage * frame.diagonal, transform)
         self.tkSwapBuffers()
+
+    def _draw_cage(self, slot, distance, transform):
+        """The low mesh pushed out to where the bake's rays start: a faint shell with its edges,
+        drawn over every view so it can be checked against the scan as well."""
+        if slot.uploaded_mesh is None:
+            return
+        if slot.cage_key != (slot.uploaded_mesh, distance):
+            data = slot.uploaded_mesh.cage(distance)
+            if slot.cage_buffer is None:
+                slot.cage_buffer = GL.glGenBuffers(1)
+            GL.glBindBuffer(GL.GL_ARRAY_BUFFER, slot.cage_buffer)
+            GL.glBufferData(GL.GL_ARRAY_BUFFER, data.nbytes, data, GL.GL_STATIC_DRAW)
+            slot.cage_key = (slot.uploaded_mesh, distance)
+        if slot.edge_count == 0:
+            self._upload_edges(slot)
+        program = self.program
+        GL.glUseProgram(program)
+        GL.glUniformMatrix4fv(GL.glGetUniformLocation(program, "transform"), 1, GL.GL_TRUE, transform)
+        GL.glUniform1i(GL.glGetUniformLocation(program, "mode"), 1)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, slot.cage_buffer)
+        position = GL.glGetAttribLocation(program, "position")
+        GL.glEnableVertexAttribArray(position)
+        GL.glVertexAttribPointer(position, 3, GL.GL_FLOAT, GL.GL_FALSE, 5 * 4, None)
+        # Depth only first, so just the cage's near side shows its edges; then a faint see-through fill.
+        GL.glColorMask(GL.GL_FALSE, GL.GL_FALSE, GL.GL_FALSE, GL.GL_FALSE)
+        GL.glEnable(GL.GL_POLYGON_OFFSET_FILL)
+        GL.glPolygonOffset(1.0, 1.0)
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, slot.uploaded_mesh.vertex_count)
+        GL.glDisable(GL.GL_POLYGON_OFFSET_FILL)
+        GL.glColorMask(GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE)
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        GL.glDepthFunc(GL.GL_LEQUAL)
+        GL.glDepthMask(GL.GL_FALSE)
+        GL.glUniform4f(GL.glGetUniformLocation(program, "flat_color"), *self.camera.cage_color, 0.06)
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, slot.uploaded_mesh.vertex_count)
+        GL.glUniform4f(GL.glGetUniformLocation(program, "flat_color"), *self.camera.cage_color, 0.3)
+        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, slot.edge_buffer)
+        GL.glDrawElements(GL.GL_LINES, slot.edge_count, GL.GL_UNSIGNED_INT, None)
+        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, 0)
+        GL.glDepthMask(GL.GL_TRUE)
+        GL.glDepthFunc(GL.GL_LESS)
+        GL.glDisable(GL.GL_BLEND)
+        GL.glDisableVertexAttribArray(position)
+        GL.glUseProgram(0)
+
+    @staticmethod
+    def _upload_edges(slot):
+        edges = slot.uploaded_mesh.edges
+        if slot.edge_buffer is None:
+            slot.edge_buffer = GL.glGenBuffers(1)
+        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, slot.edge_buffer)
+        GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, edges.nbytes, edges, GL.GL_STATIC_DRAW)
+        slot.edge_count = len(edges)
 
     def _draw(self, slot, transform):
         camera = self.camera
         # Grey with wireframe when asked for, or when there is nothing to texture the mesh with.
-        flat = slot.shading == "flat" or (slot.texture_path is None and slot.uploaded_texture is None and not camera.checker)
+        flat = camera.solid or slot.shading == "flat" or (slot.texture_path is None and slot.uploaded_texture is None and not camera.checker)
         if slot.uploaded_mesh is None or (slot.uploaded_texture is None and not camera.checker and not flat):
             return
         program = self.program
@@ -480,12 +561,7 @@ class TextureViewport(OpenGLFrame):
             GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
             GL.glDepthFunc(GL.GL_LEQUAL)
             if slot.edge_count == 0:
-                edges = slot.uploaded_mesh.edges
-                if slot.edge_buffer is None:
-                    slot.edge_buffer = GL.glGenBuffers(1)
-                GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, slot.edge_buffer)
-                GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, edges.nbytes, edges, GL.GL_STATIC_DRAW)
-                slot.edge_count = len(edges)
+                self._upload_edges(slot)
             GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, slot.edge_buffer)
             GL.glDrawElements(GL.GL_LINES, slot.edge_count, GL.GL_UNSIGNED_INT, None)
             GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, 0)

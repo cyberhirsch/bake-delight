@@ -40,7 +40,29 @@ VIEW_MODES = ["Single", "Side by side", "A/B wipe"]
 # Sidebar tabs in workflow order; the numbered ones are pipeline stages with their own run button.
 TABS = {"import": "1 IMPORT", "remesh": "2 REMESH", "uv": "3 UV", "bake": "4 BAKE", "delight": "5 DELIGHT",
         "export": "6 EXPORT", "view": "VIEW", "sys": "SYS"}
-STAGE_OF_TAB = {TABS[stage]: stage for stage in ("remesh", "uv", "bake", "delight", "export")}
+STAGES = ("remesh", "uv", "bake", "delight", "export")
+# Graphics memory -> de-light settings. One pass of the model measured on the CPU provider:
+# 0.26 GB at 512 px, 1.0 GB at 1024, 4.1 GB at 2048 (x4 per doubling); the presets leave about
+# twice that plus 1 GB for the GPU runtime and the desktop. The tile size caps every pass,
+# so 4096 px maps tile too.
+VRAM_PRESETS = {
+    "CPU only": {"force_cpu": True, "tiled": True, "scan_tiled": True, "tile_size": "2048"},
+    "4 GB": {"force_cpu": False, "tiled": True, "scan_tiled": True, "tile_size": "512"},
+    "6-8 GB": {"force_cpu": False, "tiled": True, "scan_tiled": True, "tile_size": "1024"},
+    "12 GB +": {"force_cpu": False, "tiled": True, "scan_tiled": True, "tile_size": "2048"},
+}
+# View map -> (files in the stage work folder, exported texture suffixes, 1 IMPORT settings) that can hold it.
+VIEW_MAPS = {
+    "lit": (("lit.png", "lit8.png"), ("lit",), ("lit",)),
+    "albedo": (("albedo.png", "albedo_raw.png"), ("albedo",), ()),
+    "normal": (("normal.png",), ("normal_gl",), ()),
+    "normal OS": (("normal_os.png",), (), ("normal",)),
+    "AO": (("ao8.png", "ao.png"), ("ao",), ("ao",)),
+    "roughness": (("roughness.png",), ("roughness",), ()),
+    "metallic": (("metallic.png",), ("metallic",), ()),
+    "mask": (("mask.png",), (), ("mask",)),
+}  # scanopt's order: its "[n/5]" lines count these
+STAGE_OF_TAB = {TABS[stage]: stage for stage in STAGES}
 # Original scans above this size are not parsed for the before view; the baked photo is used instead.
 MAX_BEFORE_SCAN_BYTES = 2 * 1024 * 1024 * 1024  # an 880 MB OBJ (8 M triangles) loads in about 35 s
 BACKGROUNDS = {"Void": (0.0, 0.0, 0.0), "Charcoal": (0.07, 0.07, 0.07), "Graphite": (0.16, 0.16, 0.16),
@@ -59,7 +81,7 @@ DEFAULTS = {
     "cage": 0.01, "max_ray": 0.03, "roughness": 0.8, "roughness_variation": 0.25,
     "predecimate": 2.0, "sharp": False, "scan_tiled": False, "keep_work": False,
     # view
-    "view_mode": VIEW_MODES[0], "fov": 50.0, "wireframe": False, "checker": False, "checker_cells": "32",
+    "view_mode": VIEW_MODES[0], "fov": 50.0, "wireframe": False, "solid": False, "show_cage": False, "view_map": "auto", "checker": False, "checker_cells": "32",
     "texture_filter": "mipmap", "background": "Charcoal", "orbit_speed": 0.5, "zoom_step": 1.14,
     "autorotate": False, "autorotate_speed": 20.0,
     # system
@@ -81,7 +103,8 @@ PROJECT_FILETYPES = [("Bake & Delight project", f"*{PROJECT_SUFFIX}")]
 KEYMAP = [
     ("Ctrl+N / O / S", "new / open / save project"), ("Ctrl+Shift+S", "save project as"),
     ("F5", "run the current tab's stage"), ("F6", "run all stages"), ("1 / 2 / 3", "single / side by side / wipe"),
-    ("Space", "single view: before <-> after"), ("W", "wireframe"), ("C", "UV checker"),
+    ("Space", "single view: before <-> after"), ("W", "wireframe"), ("S", "solid + edges"), ("G", "bake cage"), ("M", "next map"),
+    ("C", "UV checker"),
     ("R", "reset camera"), ("A", "auto-rotate"), ("Ctrl+L", "clear log"),
 ]
 
@@ -118,6 +141,7 @@ class DelighterGUI(TuiWidgets):
             else:
                 self.var[key] = tk.StringVar(value=str(value))
         self.preview_texture = tk.StringVar(value="lit")
+        self.vram_preset = tk.StringVar(value="custom")  # follows the settings below; not saved itself
 
         self.engine = None
         self.last_output_path = None
@@ -142,9 +166,13 @@ class DelighterGUI(TuiWidgets):
         self._bind_keys()
         for key, variable in self.var.items():
             variable.trace_add("write", lambda *_args: self._schedule_save())
-        for key in ("fov", "wireframe", "checker", "checker_cells", "texture_filter", "background", "orbit_speed", "zoom_step"):
+        for key in ("fov", "wireframe", "solid", "show_cage", "cage", "checker", "checker_cells", "texture_filter", "background", "orbit_speed", "zoom_step"):
             self.var[key].trace_add("write", lambda *_args: self._apply_view_settings())
         self.var["autorotate"].trace_add("write", lambda *_args: self._start_autorotate())
+        self.var["view_map"].trace_add("write", lambda *_args: self._on_view_map())
+        for key in ("force_cpu", "tiled", "scan_tiled", "tile_size"):
+            self.var[key].trace_add("write", lambda *_args: self._sync_vram_preset())
+        self._sync_vram_preset()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._apply_view_settings()
         self._start_autorotate()
@@ -537,6 +565,28 @@ class DelighterGUI(TuiWidgets):
         self.all_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self.progress_label = self._label(actions, "", color=DIM, size=11)
         self.progress_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.progress_bar = tk.Canvas(actions, height=3, bg=BORDER, highlightthickness=0, bd=0)
+        self.progress_bar.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.progress_bar.bind("<Configure>", lambda _event: self._draw_progress())
+        self.progress_bar.grid_remove()
+        self._progress = None  # (what, fraction) while a stage runs
+
+    def _set_progress(self, what=None, fraction=0.0):
+        """Show how far the running stage is (`what`, 0..1), or hide the bar when what is None."""
+        self._progress = None if what is None else (what, fraction)
+        if what is None:
+            self.progress_label.configure(text="")
+            self.progress_bar.grid_remove()
+            return
+        self.progress_label.configure(text=f"{what}  {round(fraction * 100):3d}%")
+        self.progress_bar.grid()
+        self._draw_progress()
+
+    def _draw_progress(self):
+        bar = self.progress_bar
+        bar.delete("all")
+        if self._progress:
+            bar.create_rectangle(0, 0, round(bar.winfo_width() * self._progress[1]), 3, fill=ACCENT, width=0)
 
     def _goto_tab(self, name):
         self.tab_var.set(name)
@@ -645,6 +695,7 @@ class DelighterGUI(TuiWidgets):
         self._row(tab, "TEXTURE SIZE", lambda parent: self._segmented(parent, self.var["resolution"], ["512", "1024", "2048", "4096"]))
         self._row(tab, "AO SAMPLES", lambda parent: self._entry(parent, self.var["ao_samples"], width=90))
         self._slider_row(tab, "CAGE", "cage", 0.001, 0.05, 49, fmt="{:.3f}")
+        self._row(tab, "", lambda parent: self._check(parent, "show cage in the view  [G]", self.var["show_cage"]))
         self._slider_row(tab, "MAX RAY", "max_ray", 0.005, 0.15, 29, fmt="{:.3f}")
         self._label(tab, "│   cage / ray: fraction of the scan's bounding diagonal", color=HINT, size=11).grid(
             row=tab.next_row, column=0, columnspan=2, sticky="w", padx=(10, 6))
@@ -673,6 +724,9 @@ class DelighterGUI(TuiWidgets):
         self._row(tab, "DEVICE", lambda parent: self._check(parent, "force CPU", self.var["force_cpu"]))
         self._row(tab, "", lambda parent: self._button(parent, "reload engine", self._load_engine_async))
         self._section(tab, "inference")
+        self._row(tab, "VRAM", lambda parent: self._option(parent, self.vram_preset, [*VRAM_PRESETS, "custom"],
+                                                           command=self._apply_vram_preset),
+                  hint="sets device and tiling · 2048 px tiles need about 9 GB")
         self._row(tab, "TILING", lambda parent: self._check(parent, "tiled (less VRAM)", self.var["tiled"]),
                   hint="only images of 2048 px and up are tiled")
         self._row(tab, "TILE SIZE", lambda parent: self._option(parent, self.var["tile_size"], ["auto", "512", "1024", "2048", "4096"]),
@@ -698,6 +752,11 @@ class DelighterGUI(TuiWidgets):
         self._row(tab, "", lambda parent: self._button(parent, "reset camera", self._reset_view))
         self._section(tab, "shading")
         self._row(tab, "OVERLAY", lambda parent: self._check(parent, "wireframe", self.var["wireframe"]))
+        self._row(tab, "SOLID", lambda parent: self._check(parent, "grey with edges, both views", self.var["solid"]))
+        self._row(tab, "CAGE", lambda parent: self._check(parent, "show the bake cage", self.var["show_cage"]),
+                  hint="distance: CAGE on 4 BAKE")
+        self._row(tab, "MAP", lambda parent: self._option(parent, self.var["view_map"], ["auto", *VIEW_MAPS]),
+                  hint="auto: per tab · else that map on the low mesh")
         self._row(tab, "TEXTURE", lambda parent: self._check(parent, "UV checker", self.var["checker"]))
         self._row(tab, "CHECKER", lambda parent: self._option(parent, self.var["checker_cells"], ["8", "16", "32", "64", "128"]),
                   hint="cells per UV unit")
@@ -769,7 +828,8 @@ class DelighterGUI(TuiWidgets):
 
         bindings = {"<F5>": self._run_current_stage, "<F6>": lambda: self._start_scan("all"), "1": lambda: set_mode(0),
                     "2": lambda: set_mode(1), "3": lambda: set_mode(2), "<space>": flip_single,
-                    "w": lambda: toggle("wireframe"), "c": lambda: toggle("checker"), "r": self._reset_view,
+                    "w": lambda: toggle("wireframe"), "s": lambda: toggle("solid"),
+                    "g": lambda: toggle("show_cage"), "m": self._next_view_map, "c": lambda: toggle("checker"), "r": self._reset_view,
                     "a": lambda: toggle("autorotate"), "<Control-l>": self._clear_log}
         for sequence, action in bindings.items():
             self.root.bind_all(sequence, guarded(action))
@@ -915,6 +975,22 @@ class DelighterGUI(TuiWidgets):
 
     # ================================================================ de-light
 
+    def _apply_vram_preset(self, name):
+        preset = VRAM_PRESETS.get(name)
+        if not preset:  # "custom" only describes the settings; picking it changes nothing
+            self._sync_vram_preset()
+            return
+        device_changed = bool(self.var["force_cpu"].get()) != preset["force_cpu"]
+        for key, value in preset.items():
+            self.var[key].set(value)
+        self._append_log(f"vram preset {name}: tiles of {preset['tile_size']} px" + (", CPU" if preset["force_cpu"] else ""))
+        if device_changed:
+            self._load_engine_async()
+
+    def _sync_vram_preset(self):
+        current = {key: self.var[key].get() for key in ("force_cpu", "tiled", "scan_tiled", "tile_size")}
+        self.vram_preset.set(next((name for name, preset in VRAM_PRESETS.items() if preset == current), "custom"))
+
     def _start_processing(self):
         if self._busy["delight"]:
             return
@@ -942,14 +1018,19 @@ class DelighterGUI(TuiWidgets):
         self._refresh_run_buttons()
         self._set_status("DE-LIGHTING", TEXT_HI)
         self._append_log(f"de-light → {output_path}  {options}")
+        self._set_progress(TABS["delight"], 0.0)
 
         def log_ui(msg):
             self._post(lambda: self._append_log(msg))
 
+        def progress_ui(fraction):
+            self._post(lambda: self._set_progress(TABS["delight"], fraction))
+
         def _work():
             started = time.time()
             try:
-                out_file, dims, dev = self.engine.process_texture(lit, norm, ao, mask, output_path, log_callback=log_ui, **options)
+                out_file, dims, dev = self.engine.process_texture(lit, norm, ao, mask, output_path, log_callback=log_ui,
+                                                                   progress_callback=progress_ui, **options)
                 result = {"albedo": out_file, "size": list(dims), "device": dev, "seconds": round(time.time() - started, 1)}
                 self._post(lambda: (self._record_result("delight", result), self._on_success(out_file, time.time() - started)))
             except Exception as e:
@@ -960,6 +1041,7 @@ class DelighterGUI(TuiWidgets):
 
     def _on_success(self, out_file, seconds):
         self._busy["delight"] = False
+        self._set_progress()
         self._refresh_run_buttons()
         self.albedo_radio.configure(state="normal")
         self.last_output_path = out_file
@@ -971,6 +1053,7 @@ class DelighterGUI(TuiWidgets):
 
     def _on_error(self, err_msg):
         self._busy["delight"] = False
+        self._set_progress()
         self._refresh_run_buttons()
         self._set_status("FAILED", ERROR)
         self._append_log(f"!! {err_msg}")
@@ -1034,6 +1117,8 @@ class DelighterGUI(TuiWidgets):
         for key, flag in (("sharp", "--sharp"), ("scan_tiled", "--tiled"), ("keep_work", "--keep-work")):
             if self.var[key].get():
                 command.append(flag)
+        if self.var["scan_tiled"].get() and self.var["tile_size"].get() != "auto":
+            command += ["--tile-size", self.var["tile_size"].get()]
         env = dict(os.environ)
         self._busy["scan"] = True
         self._refresh_run_buttons()
@@ -1043,15 +1128,24 @@ class DelighterGUI(TuiWidgets):
 
     def _run_scan_optimizer(self, command, env, source, stage="all", out=""):
         glb_path, tail, started = None, [], time.time()
+        current = TABS.get(stage, "")  # the tab label of the stage now running
         try:
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
                                        env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             for line in process.stdout:
                 line = line.rstrip()
+                if line.startswith("@progress "):
+                    try:
+                        fraction = float(line.split()[1])
+                    except (IndexError, ValueError):
+                        continue
+                    self._post(lambda what=current, fraction=fraction: self._set_progress(what, fraction))
+                    continue
                 tail = (tail + [line])[-12:]
                 if line.startswith("[") and "/5]" in line[:6]:
-                    self._post(lambda text=line: (self._append_log(f"  {text}"),
-                                                          self.progress_label.configure(text=f"scanopt {text[:5]}")))
+                    number = int(line[1])
+                    current = TABS[STAGES[number - 1]] + (f"  ·  {number}/5" if stage == "all" else "")
+                    self._post(lambda text=line, what=current: (self._append_log(f"  {text}"), self._set_progress(what, 0.0)))
                 elif line.startswith("done: "):
                     glb_path = line[6:].split("  (")[0].strip()
             code = process.wait()
@@ -1061,7 +1155,7 @@ class DelighterGUI(TuiWidgets):
         def finish():
             self._busy["scan"] = False
             self._refresh_run_buttons()
-            self.progress_label.configure(text="")
+            self._set_progress()
             if code == 0 and stage not in ("all", "export"):
                 self._set_status("DONE", ACCENT)
                 self._append_log(f"{stage} done in {time.time() - started:.0f} s")
@@ -1184,6 +1278,8 @@ class DelighterGUI(TuiWidgets):
             pass
         uv_tab = self._tab() == "uv"  # the UV tab always shows the checker and the edges
         camera.wireframe = bool(self.var["wireframe"].get()) or uv_tab
+        camera.solid = bool(self.var["solid"].get()) and not uv_tab
+        camera.cage = self._value("cage", float) if self.var["show_cage"].get() else None
         camera.checker = bool(self.var["checker"].get()) or uv_tab
         camera.texture_filter = self.var["texture_filter"].get()
         camera.background = BACKGROUNDS.get(self.var["background"].get(), BACKGROUNDS["Charcoal"])
@@ -1263,7 +1359,37 @@ class DelighterGUI(TuiWidgets):
         else:
             texture = self.last_output_path if self.last_output_path and os.path.isfile(self.last_output_path) else lit
         texture = texture if texture and os.path.isfile(texture) else None
+        chosen = self.var["view_map"].get()
+        if chosen != "auto" and os.path.basename(model) != "low_preview.obj":  # the remesh preview has no UVs
+            texture = self._map_path(chosen) or texture
         return before, (model, texture, None if texture else "flat")
+
+    def _map_path(self, kind):
+        """The newest file of one map kind: from the stage work folder, the exported textures, or the
+        maps set on 1 IMPORT. None when there is none yet."""
+        out, scan = self._scan_out(), self.var["scan"].get().strip()
+        name = os.path.splitext(os.path.basename(scan))[0]
+        work, textures = os.path.join(out, "work"), os.path.join(out, "textures")
+        candidates = [os.path.join(work, file) for file in VIEW_MAPS[kind][0]]
+        candidates += [os.path.join(textures, f"{name}_{suffix}.png") for suffix in VIEW_MAPS[kind][1]]
+        candidates += [self.var[key].get() for key in VIEW_MAPS[kind][2]]
+        if kind == "albedo" and self.last_output_path:
+            candidates.append(self.last_output_path)
+        found = [path for path in candidates if path and os.path.isfile(path)]
+        return max(found, key=os.path.getmtime) if found else None
+
+    def _on_view_map(self):
+        chosen = self.var["view_map"].get()
+        if chosen != "auto" and not self._map_path(chosen):
+            self._append_log(f"view: no {chosen} map yet")
+        elif chosen != "auto":
+            self.preview_texture.set("albedo")  # single view: the low mesh, which wears the map
+        self._refresh_viewport()
+
+    def _next_view_map(self):
+        names = ["auto", *VIEW_MAPS]
+        current = self.var["view_map"].get()
+        self.var["view_map"].set(names[(names.index(current) + 1) % len(names)] if current in names else "auto")
 
     def _update_uv_layout(self):
         model = self.var["model"].get()

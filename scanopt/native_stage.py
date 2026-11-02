@@ -39,6 +39,17 @@ TO_BLENDER = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], np.float64)
 BLENDER_TO_YUP = TO_BLENDER.T
 
 
+_last_progress = [None]
+
+
+def progress(fraction: float) -> None:
+    """How far the running stage is, 0..1, as a line the app turns into its progress bar."""
+    step = round(min(max(fraction, 0.0), 1.0), 2)
+    if step != _last_progress[0]:
+        _last_progress[0] = step
+        print(f"@progress {step:.2f}", flush=True)
+
+
 def available() -> str | None:
     """None when every package the native backend needs imports, else what is missing."""
     missing = []
@@ -202,10 +213,13 @@ def export_high(scan: Path, obj: Path, target: int = 0) -> int:
     else:
         mesh = trimesh.load(str(scan), force="mesh", process=False)
         positions, faces = np.asarray(mesh.vertices, np.float64), np.asarray(mesh.faces, np.int64)
+    progress(0.1)
     positions, faces, _ = weld(positions, faces)
     if target:
         positions, faces = decimate(positions, faces, target)
+    progress(0.25)
     write_triangle_obj(obj, positions, faces)
+    progress(0.3)
     return len(faces)
 
 
@@ -697,6 +711,7 @@ def bake(high, low, photo, resolution: int, cage: float, max_ray: float, ao_samp
 
     # Rays start just outside the low surface and look inward for the first high-res hit (as
     # Blender's selected-to-active bake without a cage); misses then look outward.
+    progress(0.2)
     start, reach = diagonal * cage, diagonal * (cage + max_ray)
     prim, hu, hv, _ = tracer.first(point + normal * start, -normal, np.full(len(point), reach))
     miss = prim < 0
@@ -738,12 +753,14 @@ def bake(high, low, photo, resolution: int, cage: float, max_ray: float, ao_samp
     reach = np.full(len(origin), diagonal * 0.1)
     rng = np.random.default_rng(0)
     open_sky = np.zeros(len(origin))
+    progress(0.35)
     for sample in range(ao_samples):
         u1 = (sample + rng.random(len(origin))) / ao_samples  # stratified in elevation
         direction = hemisphere(hit_normal, u1, rng.random(len(origin)))
         below = np.sum(direction * geometric, axis=1) < 0
         direction[below] -= 2 * np.sum(direction[below] * geometric[below], axis=1, keepdims=True) * geometric[below]
         open_sky += ~tracer.occluded(origin, direction, reach)
+        progress(0.35 + 0.5 * (sample + 1) / max(ao_samples, 1))  # AO: most of the bake
     ao = open_sky / max(ao_samples, 1)
     if pbr is not None:
         ao = ao * values["occlusion"][:, 0]  # the model's own occlusion map on top of the baked AO
@@ -790,7 +807,9 @@ def layout(low_mesh: Path, scan: Path, out: Path, resolution: int, margin: int, 
     out.mkdir(parents=True, exist_ok=True)
     positions, sizes, loop_verts = read_polygon_obj(low_mesh)
     tri_loops, tri_poly = fan(sizes)
+    progress(0.1)
     loop_uv, unwrap_info = unwrap(positions, loop_verts, tri_loops, tri_poly, resolution, margin)
+    progress(0.85)
     log(f"UNWRAP {unwrap_info}")
     np.savez(out / "layout.npz", positions=positions, sizes=sizes, loop_verts=loop_verts, loop_uv=loop_uv,
              resolution=resolution, margin=margin, info=json.dumps(unwrap_info))
@@ -816,11 +835,13 @@ def bake_layout(scan: Path, texture: Path | None, out: Path, cage: float, max_ra
     tri_loops, _ = fan(sizes)
     if source == "pbr":
         model = load_pbr(scan, {"base_color": texture, **(maps or {})}, log)
+        progress(0.15)
         return _bake_and_write(scan, out, model.positions, model.faces, model.corner_uv, None, positions, sizes, loop_verts,
                                loop_uv, tri_loops, unwrap_info, resolution, margin, cage, max_ray, ao_samples, topology,
                                log, pbr=model)
     raw_pos, raw_faces, corner_uv, photo = load_scan(scan, texture)
     high_pos, high_faces, _ = weld(raw_pos, raw_faces)
+    progress(0.15)
     return _bake_and_write(scan, out, high_pos, high_faces, corner_uv, photo, positions, sizes, loop_verts, loop_uv,
                            tri_loops, unwrap_info, resolution, margin, cage, max_ray, ao_samples, topology, log)
 
@@ -837,8 +858,9 @@ def _bake_and_write(scan, out, high_pos, high_faces, corner_uv, photo, positions
     empty[rows, cols] = False
     maps["normal_os"][empty] = 0
     names = ("lit", "normal_ts", "normal_os", "ao") + (("roughness", "metallic") if pbr is not None else ())
-    for name in names:  # extend into the gutter, like Blender's bake margin
+    for index, name in enumerate(names):  # extend into the gutter, like Blender's bake margin
         write_exr(out / f"{name}.exr", fill_gutter(maps[name], ~empty, margin))
+        progress(0.85 + 0.1 * (index + 1) / len(names))
 
     uv_tris = loop_uv[tri_loops].astype(np.float32)
     np.save(out / "uv_tris.npy", uv_tris)

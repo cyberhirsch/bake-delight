@@ -107,6 +107,8 @@ def scan_command(project: Project, machine: dict | None = None) -> tuple[list[st
     for key, flag in (("sharp", "--sharp"), ("tiled", "--tiled"), ("keep_work", "--keep-work")):
         if s[key]:
             command.append(flag)
+    if s["tiled"] and project.settings["delight"]["tile_size"]:
+        command += ["--tile-size", str(project.settings["delight"]["tile_size"])]
     env = dict(os.environ, PYTHONUNBUFFERED="1")
     return command, env, out
 
@@ -119,6 +121,8 @@ def scan(project: Project, log=print) -> dict:
     try:
         for line in process.stdout:
             line = line.rstrip()
+            if line.startswith("@progress "):
+                continue
             tail = (tail + [line])[-20:]
             if line.startswith("done: "):
                 glb = line[6:].split("  (")[0].strip()

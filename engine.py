@@ -261,13 +261,19 @@ class DelighterInferenceEngine:
         tile_overlap: float = 0.25,
         bit_depth: int = 8,
         apply_mask: bool = True,
+        progress_callback=None,
     ):
         """tile_size 0 = half the image; tile_overlap is a fraction of the tile;
-        bit_depth 8 or 16 for the PNG written; apply_mask blacks out texels outside the UVs."""
+        bit_depth 8 or 16 for the PNG written; apply_mask blacks out texels outside the UVs;
+        progress_callback(fraction) hears how far it is, 0..1."""
         def log(msg):
             print(f"[Inference] {msg}")
             if log_callback:
                 log_callback(msg)
+
+        def progress(fraction):
+            if progress_callback:
+                progress_callback(fraction)
 
         log("Loading texture maps onto GPU memory...")
         lit_t = self._load_image(lit_path, channels=3)
@@ -303,6 +309,7 @@ class DelighterInferenceEngine:
         lit_linear = srgb_to_linear(lit_t)
 
         # 2. Geometry Stacking: Normals(3) + AO(1) + Mask(1) = 5 Channels
+        progress(0.1)
         log("Stacking 5-Channel Geometry Maps...")
         geometry_t = np.concatenate([normal_t, ao_t, mask_t], axis=0)
 
@@ -357,6 +364,7 @@ class DelighterInferenceEngine:
 
                     accumulator[:, y0:y1, x0:x1] += tile_prediction * tile_weights
                     weight_map[:, y0:y1, x0:x1] += tile_weights
+                    progress(0.15 + 0.7 * tile_number / total_tiles)
 
             pred_albedo_linear = accumulator / np.maximum(weight_map, 1e-7)
 
@@ -385,6 +393,7 @@ class DelighterInferenceEngine:
                 },
             )
             pred_albedo_linear = outputs[0][0, :, :h, :w]
+            progress(0.85)
 
         # 4. Convert Linear -> sRGB & Apply UV Mask
         log("Converting predicted Albedo to sRGB space...")
@@ -393,6 +402,7 @@ class DelighterInferenceEngine:
             pred_srgb = pred_srgb * mask_t
 
         # 5. Save output map to disk
+        progress(0.9)
         log(f"Saving final {bit_depth}-bit image to disk...")
         pred_np = np.transpose(pred_srgb, (1, 2, 0))
         if bit_depth == 16:
@@ -405,6 +415,7 @@ class DelighterInferenceEngine:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if not cv2.imwrite(str(output_path), output_bgr):
             raise IOError(f"Failed to write output image: {output_path}")
+        progress(1.0)
         log(f"SUCCESS: Saved output to '{output_path}'")
 
         return str(output_path), (w, h), self.device_info
