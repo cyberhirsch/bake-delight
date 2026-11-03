@@ -168,7 +168,8 @@ def main() -> int:
                                        log=lambda text: print(text, flush=True))
             native_stage.progress(1.0)
             print(f"      uv mesh: {work / 'low_uv.obj'}", flush=True)
-            done("uv", since, unwrap="xatlas", resolution=args.resolution, charts=info.get("charts"))
+            done("uv", since, unwrap="xatlas", resolution=args.resolution, charts=info.get("charts"),
+                 **{key: info.get(key) for key in ("stretched_triangles", "worst_stretch", "stray_origin_corners")})
 
         elif stage == "bake":
             print(f"{tag} baking high->low (Embree)", flush=True)

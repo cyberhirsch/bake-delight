@@ -278,19 +278,32 @@ def unwrap(positions, loop_verts, tri_loops, tri_poly, resolution: int, margin: 
         raise RuntimeError("xatlas unwrap produced non-finite UVs")
     mirrored = triangle_areas(loop_uv[tri_loops]) < 0
     loop_uv[np.unique(tri_loops[mirrored]), 0] *= -1
-    return pack(loop_uv, loop_verts, tri_loops, resolution, margin), {"unwrap": "xatlas", "charts": int(charts), "split_polygons": split}
+    packed = pack(loop_uv, loop_verts, tri_loops, resolution, margin)
+    check = uv_check(positions, loop_verts, packed, tri_loops)
+    if check["stray_origin_corners"] or check["worst_stretch"] > 50:  # broken slivers measured 680-840x
+        raise RuntimeError(f"the UV atlas has triangles stretched across it ({check}); "
+                           "the bake would show lines across the texture")
+    return packed, {"unwrap": "xatlas", "charts": int(charts), "split_polygons": split, **check}
 
 
 def pack(loop_uv, loop_verts, tri_loops, resolution: int, margin: int, tries: int = 8) -> np.ndarray:
-    """Pack the charts (connected UV triangles) into one square atlas, as large as fits."""
+    """Pack the charts (connected UV triangles) into one square atlas, as large as fits.
+
+    xatlas skips faces under a fixed area epsilon and returns (0, 0) for their vertices, also
+    where a kept face shares such a vertex: one sliver quad then stretched a neighbour across the
+    whole atlas. So the UVs go in scaled up (only truly flat faces stay under the epsilon), flat
+    faces stay out of the packed mesh and take their corners from the packed ones afterwards."""
     import xatlas
+    scale = float(resolution)  # UV units handed to xatlas: about a texel
     key = np.concatenate([loop_verts[:, None].astype(np.float64), np.round(loop_uv.astype(np.float64) * 1e6)], axis=1)
     _, first, uv_vertex = np.unique(key, axis=0, return_index=True, return_inverse=True)
     uv_vertex = uv_vertex.reshape(-1)
-    uv_points = loop_uv[first].astype(np.float32)
-    triangles = uv_vertex[tri_loops].astype(np.uint32)
-    area = np.abs(triangle_areas(loop_uv[tri_loops])).sum()
-    density = resolution * np.sqrt(0.45 / max(area, 1e-12))  # texels per UV unit, first guess
+    uv_points = (loop_uv[first] * scale).astype(np.float32)
+    corners = uv_vertex[tri_loops]
+    areas = np.abs(triangle_areas(uv_points[corners].astype(np.float64)))
+    kept = areas > 1e-6  # texels²
+    triangles = corners[kept].astype(np.uint32)
+    density = resolution * np.sqrt(0.45 / max(areas.sum() / scale ** 2, 1e-12)) / scale  # texels per unit, first guess
     best = None
     for _ in range(tries):
         atlas = xatlas.Atlas()
@@ -312,9 +325,37 @@ def pack(loop_uv, loop_verts, tri_loops, resolution: int, margin: int, tries: in
             density *= 0.9
     if best is None:
         raise RuntimeError("xatlas could not pack the charts into one texture")
+    placed = np.full((len(uv_points), 2), np.nan, np.float32)
+    placed[triangles.reshape(-1)] = best.reshape(-1, 2)
+    # Flat faces cover no texels: all three corners go to one point already placed (one of their
+    # UV vertices, else their 3D vertex elsewhere), so none is left at (0, 0) and none spans charts.
+    by_vertex = {}
+    for loop, vertex in zip(tri_loops[kept].reshape(-1), corners[kept].reshape(-1)):
+        by_vertex.setdefault(int(loop_verts[loop]), placed[vertex])
     packed = loop_uv.copy()
-    packed[tri_loops] = best
+    for t in np.flatnonzero(~kept):
+        anchor = next((placed[v] for v in corners[t] if np.isfinite(placed[v]).all()), None)
+        if anchor is None:
+            anchor = next((by_vertex[int(loop_verts[l])] for l in tri_loops[t] if int(loop_verts[l]) in by_vertex), 0.0)
+        packed[tri_loops[t]] = anchor
+    packed[tri_loops[kept]] = best  # a loop shared with a flat face keeps its packed place
     return packed
+
+
+def uv_check(positions, loop_verts, loop_uv, tri_loops, limit: float = 4.0) -> dict:
+    """Atlas sanity check: triangles whose UV edges are more than `limit` times the median
+    texel density (stretched across the atlas), and corners at (0, 0) that nothing else shares."""
+    uv = loop_uv[tri_loops].astype(np.float64)
+    points = positions[loop_verts[tri_loops]]
+    uv_edges = np.linalg.norm(uv - np.roll(uv, 1, axis=1), axis=2).sum(axis=1)
+    edges = np.linalg.norm(points - np.roll(points, 1, axis=1), axis=2).sum(axis=1)
+    solid = edges > 1e-12
+    ratio = uv_edges[solid] / edges[solid]
+    relative = ratio / np.median(ratio)
+    at_origin = np.abs(loop_uv).sum(axis=1) < 1e-4  # within about half a texel at 4096
+    stray = int((at_origin[tri_loops].any(axis=1) & ~at_origin[tri_loops].all(axis=1)).sum())
+    return {"stretched_triangles": int((relative > limit).sum()), "worst_stretch": round(float(relative.max()), 1),
+            "stray_origin_corners": stray}
 
 
 # ---------------------------------------------------------------- bake

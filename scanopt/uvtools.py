@@ -42,6 +42,8 @@ def join_split_polygons(tri_loops, corner_uv, corner_pos, tri_poly, loop_count):
             across = float(np.linalg.norm(np.cross(edge, p2 - p0))) / length2
             a, b = placed[int(tri_loops[t, k0])], placed[int(tri_loops[t, k1])]
             d = b - a
+            if float(d @ d) < 1e-14:  # the placed edge has no length: nothing to rebuild on
+                continue
             for side in (1.0, -1.0):
                 uv = np.empty((3, 2), np.float32)
                 uv[k0], uv[k1] = a, b
