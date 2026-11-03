@@ -45,6 +45,7 @@ import native_stage  # noqa: E402
 from native_stage import fill_gutter  # noqa: E402
 
 STAGES = ["remesh", "uv", "bake", "delight", "export"]
+STAGE_OUTPUT = {"remesh": "low.obj", "uv": "layout.npz", "bake": "lit.png", "delight": "albedo_raw.png"}  # checked by need()
 # Shown in the GUI dropdown, in this order. DJM (SIGGRAPH 2026) joins once its code is published.
 REMESHERS = {
     "decimate": "Triangles - decimation (QEM)",
@@ -123,8 +124,14 @@ def main() -> int:
     started = time.time()
 
     def need(path: Path, stage: str):
+        """path is what `stage` wrote; it must exist and be newer than what the stages before it wrote."""
         if not path.is_file():
             raise SystemExit(f"{path.name} is missing: run the {stage} stage first")
+        for earlier in STAGES[:STAGES.index(stage)]:
+            source = work / STAGE_OUTPUT[earlier]
+            if source.is_file() and source.stat().st_mtime > path.stat().st_mtime:
+                raise SystemExit(f"{path.name} is older than {source.name} from the {earlier} stage: "
+                                 f"run the {stage} stage again")
 
     def done(stage: str, since: float, **values):
         state[stage] = {**values, "seconds": round(time.time() - since, 1)}
@@ -179,7 +186,7 @@ def main() -> int:
             native_stage.bake_layout(args.input, args.texture, work, args.cage, args.max_ray, args.ao_samples,
                                      topology="quad" if quads else "tri", log=lambda text: print(text, flush=True),
                                      source=args.source, maps={k: v.resolve() for k, v in maps.items() if v})
-            write_delight_inputs(work, args.resolution)
+            write_delight_inputs(work)
             native_stage.progress(1.0)
             print(f"      maps: {work / 'lit.png'}", flush=True)
             done("bake", since)
@@ -230,10 +237,11 @@ def baked_source(work: Path) -> str:
         return "scan"
 
 
-def write_delight_inputs(work: Path, resolution: int) -> None:
-    """The baked EXRs as the de-lighter's inputs (16-bit PNGs) plus the UV coverage mask."""
-    mask = rasterise_mask(np.load(work / "uv_tris.npy"), resolution)
-    write_png16(work / "lit.png", to_srgb(read_exr(work / "lit.exr")))
+def write_delight_inputs(work: Path) -> None:
+    """The baked EXRs as the de-lighter's inputs (16-bit PNGs) plus the UV coverage mask at the bake's size."""
+    lit = read_exr(work / "lit.exr")
+    mask = rasterise_mask(np.load(work / "uv_tris.npy"), lit.shape[0])
+    write_png16(work / "lit.png", to_srgb(lit))
     write_png16(work / "normal_os.png", read_exr(work / "normal_os.exr"))
     write_png16(work / "ao.png", read_exr(work / "ao.exr")[..., 0])
     cv2.imwrite(str(work / "mask.png"), mask)
