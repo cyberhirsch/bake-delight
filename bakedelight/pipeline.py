@@ -110,6 +110,11 @@ def scan_command(project: Project, machine: dict | None = None) -> tuple[list[st
     if s["tiled"] and project.settings["delight"]["tile_size"]:
         command += ["--tile-size", str(project.settings["delight"]["tile_size"])]
     env = dict(os.environ, PYTHONUNBUFFERED="1")
+    # The de-light step inside scanopt reads this, as the GUI's child does from its own process.
+    if project.settings["delight"]["force_cpu"]:
+        env["DELIGHTER_FORCE_CPU"] = "1"
+    else:
+        env.pop("DELIGHTER_FORCE_CPU", None)
     return command, env, out
 
 
