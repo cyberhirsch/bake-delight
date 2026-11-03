@@ -263,7 +263,7 @@ def triangle_areas(uv: np.ndarray) -> np.ndarray:
                   - (uv[:, 1, 1] - uv[:, 0, 1]) * (uv[:, 2, 0] - uv[:, 0, 0]))
 
 
-def unwrap(positions, loop_verts, tri_loops, tri_poly, resolution: int, margin: int) -> tuple[np.ndarray, dict]:
+def unwrap(positions, loop_verts, tri_loops, tri_poly, resolution: int, margin: int, log=print) -> tuple[np.ndarray, dict]:
     """xatlas charts the triangles, polygons it split across charts are rejoined, mirrored
     charts are flipped back, and xatlas packs the result as a UV mesh into the square."""
     import xatlas
@@ -278,22 +278,64 @@ def unwrap(positions, loop_verts, tri_loops, tri_poly, resolution: int, margin: 
         raise RuntimeError("xatlas unwrap produced non-finite UVs")
     mirrored = triangle_areas(loop_uv[tri_loops]) < 0
     loop_uv[np.unique(tri_loops[mirrored]), 0] *= -1
-    packed = pack(loop_uv, loop_verts, tri_loops, resolution, margin)
+    packed, pack_info = pack(loop_uv, loop_verts, tri_loops, resolution, margin, log=log)
     check = uv_check(positions, loop_verts, packed, tri_loops)
     if check["stray_origin_corners"] or check["worst_stretch"] > 50:  # broken slivers measured 680-840x
         raise RuntimeError(f"the UV atlas has triangles stretched across it ({check}); "
                            "the bake would show lines across the texture")
-    return packed, {"unwrap": "xatlas", "charts": int(charts), "split_polygons": split, **check}
+    return packed, {"unwrap": "xatlas", "charts": int(charts), "split_polygons": split, **pack_info, **check}
 
 
-def pack(loop_uv, loop_verts, tri_loops, resolution: int, margin: int, tries: int = 8) -> np.ndarray:
+def pack_density(uv_points, triangles, resolution: int, margin: int, start: float, floor: float):
+    """The largest texel density (within ~2 %) at which xatlas packs every chart into one atlas,
+    and the corner UVs packed at it; (None, None) when even `floor` does not fit."""
+    import xatlas
+
+    def attempt(density):
+        atlas = xatlas.Atlas()
+        atlas.add_uv_mesh(uv_points, triangles)
+        options = xatlas.PackOptions()
+        options.resolution, options.padding, options.texels_per_unit = resolution, margin, float(density)
+        options.bilinear, options.rotate_charts = True, True
+        atlas.generate(pack_options=options)
+        if atlas.atlas_count != 1:
+            return None
+        _, indices, uvs = atlas[0]
+        return (uvs * np.array([atlas.width, atlas.height], np.float32) / resolution)[indices]
+
+    fits, fails, best = None, None, None
+    density = start
+    while fits is None and density >= floor:  # shrink until it fits
+        if (packed := attempt(density)) is not None:
+            fits, best = density, packed
+        else:
+            fails, density = density, density * 0.7
+    if fits is None:
+        return None, None
+    while fails is None:  # grow until it overflows
+        if (packed := attempt(fits * 1.4)) is not None:
+            fits, best = fits * 1.4, packed
+        else:
+            fails = fits * 1.4
+    while fails / fits > 1.02:  # bisect between the two
+        middle = np.sqrt(fits * fails)
+        if (packed := attempt(middle)) is not None:
+            fits, best = middle, packed
+        else:
+            fails = middle
+    return fits, best
+
+
+def pack(loop_uv, loop_verts, tri_loops, resolution: int, margin: int, log=print) -> tuple[np.ndarray, dict]:
     """Pack the charts (connected UV triangles) into one square atlas, as large as fits.
 
     xatlas skips faces under a fixed area epsilon and returns (0, 0) for their vertices, also
     where a kept face shares such a vertex: one sliver quad then stretched a neighbour across the
     whole atlas. So the UVs go in scaled up (only truly flat faces stay under the epsilon), flat
-    faces stay out of the packed mesh and take their corners from the packed ones afterwards."""
-    import xatlas
+    faces stay out of the packed mesh and take their corners from the packed ones afterwards.
+
+    When the charts do not fit with `margin` pixels between them even at half the first density
+    guess (about 11 % of the texture covered), the margin is halved, down to 2 px."""
     scale = float(resolution)  # UV units handed to xatlas: about a texel
     key = np.concatenate([loop_verts[:, None].astype(np.float64), np.round(loop_uv.astype(np.float64) * 1e6)], axis=1)
     _, first, uv_vertex = np.unique(key, axis=0, return_index=True, return_inverse=True)
@@ -303,28 +345,17 @@ def pack(loop_uv, loop_verts, tri_loops, resolution: int, margin: int, tries: in
     areas = np.abs(triangle_areas(uv_points[corners].astype(np.float64)))
     kept = areas > 1e-6  # texels²
     triangles = corners[kept].astype(np.uint32)
-    density = resolution * np.sqrt(0.45 / max(areas.sum() / scale ** 2, 1e-12)) / scale  # texels per unit, first guess
-    best = None
-    for _ in range(tries):
-        atlas = xatlas.Atlas()
-        atlas.add_uv_mesh(uv_points, triangles)
-        options = xatlas.PackOptions()
-        options.resolution, options.padding, options.texels_per_unit = resolution, margin, float(density)
-        options.bilinear, options.rotate_charts = True, True
-        atlas.generate(pack_options=options)
-        if atlas.atlas_count == 1:
-            _, indices, uvs = atlas[0]
-            best = (uvs * np.array([atlas.width, atlas.height], np.float32) / resolution)[indices]
-            fill = max(atlas.width, atlas.height) / resolution
-            if fill > 0.97:
-                break
-            density *= min(1.15, 0.99 / fill)
-        else:
-            if best is not None:
-                break
-            density *= 0.9
-    if best is None:
-        raise RuntimeError("xatlas could not pack the charts into one texture")
+    start = resolution * np.sqrt(0.45 / max(areas.sum() / scale ** 2, 1e-12)) / scale  # texels per unit, first guess
+    used = margin
+    while True:
+        density, best = pack_density(uv_points, triangles, resolution, used, start, start * 0.5)
+        if best is not None:
+            break
+        if used <= 2:
+            raise RuntimeError(f"the UV charts do not fit into a {resolution} px texture even with a 2 px margin: "
+                               "use a larger texture or fewer faces")
+        log(f"      the charts do not fit with a {used} px margin at {resolution} px: trying {max(2, used // 2)} px")
+        used = max(2, used // 2)
     placed = np.full((len(uv_points), 2), np.nan, np.float32)
     placed[triangles.reshape(-1)] = best.reshape(-1, 2)
     # Flat faces cover no texels: all three corners go to one point already placed (one of their
@@ -339,7 +370,7 @@ def pack(loop_uv, loop_verts, tri_loops, resolution: int, margin: int, tries: in
             anchor = next((by_vertex[int(loop_verts[l])] for l in tri_loops[t] if int(loop_verts[l]) in by_vertex), 0.0)
         packed[tri_loops[t]] = anchor
     packed[tri_loops[kept]] = best  # a loop shared with a flat face keeps its packed place
-    return packed
+    return packed, {"margin": used}
 
 
 def uv_check(positions, loop_verts, loop_uv, tri_loops, limit: float = 4.0) -> dict:
@@ -849,11 +880,11 @@ def layout(low_mesh: Path, scan: Path, out: Path, resolution: int, margin: int, 
     positions, sizes, loop_verts = read_polygon_obj(low_mesh)
     tri_loops, tri_poly = fan(sizes)
     progress(0.1)
-    loop_uv, unwrap_info = unwrap(positions, loop_verts, tri_loops, tri_poly, resolution, margin)
+    loop_uv, unwrap_info = unwrap(positions, loop_verts, tri_loops, tri_poly, resolution, margin, log=log)
     progress(0.85)
     log(f"UNWRAP {unwrap_info}")
     np.savez(out / "layout.npz", positions=positions, sizes=sizes, loop_verts=loop_verts, loop_uv=loop_uv,
-             resolution=resolution, margin=margin, info=json.dumps(unwrap_info))
+             resolution=resolution, margin=unwrap_info["margin"], info=json.dumps(unwrap_info))
     axes = TO_BLENDER if scan.suffix.lower() in Y_UP else np.eye(3)
     shown = positions @ (BLENDER_TO_YUP @ axes).T
     starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
