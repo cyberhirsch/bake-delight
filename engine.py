@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import time
 from pathlib import Path
 
 import cv2
@@ -58,6 +59,58 @@ elif sys.platform.startswith("linux"):
         ).strip(os.pathsep)
 
 import onnxruntime as ort
+
+
+def _say(message: str) -> None:
+    print(f"[Engine Init] {message}", flush=True)
+
+
+def _gpu_names() -> list[str]:
+    """The graphics adapters Windows knows, with driver versions: tells a missing driver from a missing GPU."""
+    if os.name != "nt":
+        return []
+    command = ["powershell.exe", "-NoProfile", "-Command",
+               "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name + ' | driver ' + $_.DriverVersion }"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    except (OSError, subprocess.SubprocessError) as error:
+        return [f"could not ask Windows: {error}"]
+
+
+def _free_ram_gb() -> float | None:
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    class Status(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                    ("available", ctypes.c_ulonglong), ("unused", ctypes.c_ulonglong * 5)]
+
+    status = Status(length=ctypes.sizeof(Status))
+    return status.available / 2 ** 30 if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)) else None
+
+
+def _system_report() -> None:
+    _say(f"app: {'packaged' if getattr(sys, 'frozen', False) else 'source'}, {sys.executable}")
+    _say(f"system: {platform.platform()}, Python {platform.python_version()}, working folder {os.getcwd()}")
+    ram = _free_ram_gb()
+    if ram is not None:
+        _say(f"free RAM: {ram:.1f} GB")
+    for name in _gpu_names() or ["none reported"]:
+        _say(f"graphics adapter: {name}")
+    _say(f"ONNX Runtime {ort.__version__} from {Path(ort.__file__).parent}")
+    _say(f"providers available: {ort.get_available_providers()}")
+    for key in ("DELIGHTER_FORCE_CPU", "DELIGHTER_MODEL"):
+        if os.environ.get(key):
+            _say(f"{key}={os.environ[key]}")
+
+
+def _map_report(name: str, path: str, tensor: np.ndarray) -> str:
+    size = os.path.getsize(path) / 2 ** 20
+    return (f"{name}: {path} ({size:.1f} MB, {tensor.shape[2]}x{tensor.shape[1]}, {tensor.shape[0]} channels, "
+            f"min {tensor.min():.3f} max {tensor.max():.3f} mean {tensor.mean():.3f})")
 
 
 def _hardware_name_for_provider(provider: str) -> str:
@@ -143,14 +196,16 @@ class DelighterInferenceEngine:
     TILE_SIZE = 2048
 
     def __init__(self, model_path: str = "weights/delighter_model_fp16.onnx"):
-        print("\n" + "="*50)
-        print("[Engine Init] Initializing ONNX Runtime engine...")
+        started = time.time()
+        print("\n" + "="*50, flush=True)
+        _say("Initializing ONNX Runtime engine...")
+        _system_report()
         
         available_providers = ort.get_available_providers()
         force_cpu = os.environ.get("DELIGHTER_FORCE_CPU", "").lower() in {"1", "true", "yes"}
         if force_cpu:
             providers = ["CPUExecutionProvider"]
-            print("[Engine Init] CPU fallback forced by DELIGHTER_FORCE_CPU")
+            _say("CPU fallback forced by DELIGHTER_FORCE_CPU")
         elif "CUDAExecutionProvider" in available_providers:
             providers = [
                 (
@@ -183,12 +238,15 @@ class DelighterInferenceEngine:
         if not resolved_model_path.is_file():
             raise FileNotFoundError(f"Model file not found: {resolved_model_path}")
 
+        _say(f"model: {resolved_model_path} ({resolved_model_path.stat().st_size / 2 ** 20:.1f} MB)")
+        requested = providers[0][0] if isinstance(providers[0], tuple) else providers[0]
+        _say(f"loading the model with {requested}...")
         try:
             self.model = ort.InferenceSession(str(resolved_model_path), sess_options=session_options, providers=providers)
         except Exception as provider_error:
             if providers and providers[0] != "CPUExecutionProvider" and not force_cpu:
                 failed_provider = providers[0][0] if isinstance(providers[0], tuple) else providers[0]
-                print(f"[Engine Init] {failed_provider} initialization failed; falling back to CPU: {provider_error}")
+                _say(f"WARNING: {failed_provider} initialization failed; falling back to CPU: {provider_error}")
                 providers = ["CPUExecutionProvider"]
                 self.model = ort.InferenceSession(str(resolved_model_path), providers=providers)
             else:
@@ -207,13 +265,36 @@ class DelighterInferenceEngine:
         self.is_accelerated = self.execution_provider != "CPUExecutionProvider"
         self.device_info = f"{self.hardware_device} via {self.runtime_name} / {self.provider_name}"
         self.device_display = f"{self.runtime_name} · {self.provider_name}\n{self.hardware_device}"
-        print(f"[Engine Init] Active Hardware Device: {self.device_info}")
+        _say(f"model loaded in {time.time() - started:.1f} s; session providers: {active_providers}")
+        _say(f"Active Hardware Device: {self.device_info}")
+        if requested != "CPUExecutionProvider" and not self.is_accelerated:
+            _say(f"WARNING: {requested} was asked for but the model runs on the CPU, which is far slower")
         self.input_names = [item.name for item in self.model.get_inputs()]
         self.output_name = self.model.get_outputs()[0].name
         if len(self.input_names) != 2:
             raise ValueError(f"Expected 2 ONNX inputs, found {len(self.input_names)}: {self.input_names}")
-        print(f"[Engine Init] ONNX inputs: {self.input_names}")
-        print("="*50 + "\n")
+        for item in self.model.get_inputs() + self.model.get_outputs():
+            _say(f"model tensor {item.name}: {item.type} {item.shape}")
+        self._self_test()
+        _say(f"engine ready, {time.time() - started:.1f} s in all")
+        print("="*50 + "\n", flush=True)
+
+    def _self_test(self) -> None:
+        """A small inference at load time, so a broken device shows up now rather than in the first job."""
+        size, started = 256, time.time()
+        lit = np.full((1, 3, size, size), 0.5, np.float32)
+        geometry = np.ones((1, 5, size, size), np.float32)
+        geometry[:, :2] = 0.5  # a flat normal, full AO, full mask
+        try:
+            output = self.model.run([self.output_name], {self.input_names[0]: lit, self.input_names[1]: geometry})[0]
+        except Exception as error:
+            _say(f"WARNING: self-test failed on {self.device_info}: {error}")
+            return
+        if np.isfinite(output).all():
+            _say(f"self-test OK: {size} px in {time.time() - started:.2f} s, output {output.shape}, "
+                 f"min {output.min():.3f} max {output.max():.3f}")
+        else:
+            _say(f"WARNING: self-test returned NaN or infinite values on {self.device_info}; try force CPU")
 
     def _load_image(self, path: str, channels: int = 3) -> np.ndarray:
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
@@ -266,8 +347,10 @@ class DelighterInferenceEngine:
         """tile_size 0 = half the image; tile_overlap is a fraction of the tile;
         bit_depth 8 or 16 for the PNG written; apply_mask blacks out texels outside the UVs;
         progress_callback(fraction) hears how far it is, 0..1."""
+        started = time.time()
+
         def log(msg):
-            print(f"[Inference] {msg}")
+            print(f"[Inference {time.time() - started:6.1f} s] {msg}", flush=True)
             if log_callback:
                 log_callback(msg)
 
@@ -275,6 +358,8 @@ class DelighterInferenceEngine:
             if progress_callback:
                 progress_callback(fraction)
 
+        log(f"Starting on {self.device_info}: tiled {tiled_mode}, tile size {tile_size or 'auto'}, overlap {tile_overlap}, "
+            f"{bit_depth}-bit, apply mask {apply_mask}")
         log("Loading texture maps onto GPU memory...")
         lit_t = self._load_image(lit_path, channels=3)
         normal_t = self._load_image(normal_path, channels=3)
@@ -302,6 +387,14 @@ class DelighterInferenceEngine:
         if (h & (h - 1)) != 0 or h <= 0:
             raise ValueError(f"Image resolution {w}x{h} must be a power of two (e.g., 512, 1024, 2048, 4096, 8192).")
 
+        log(_map_report("lit", lit_path, lit_t))
+        log(_map_report("normal", normal_path, normal_t))
+        log(_map_report("ao", ao_path, ao_t))
+        log(_map_report("mask", mask_path, mask_t))
+        inside = mask_t[0] > 0.5
+        log(f"mask covers {inside.mean():.1%} of the map")
+        if inside.mean() < 0.001:
+            log("WARNING: the mask is practically empty, so the result will be black")
         log(f"Resolution: {w}x{h} px | Target Device: {self.device_info}")
 
         # 1. Color Space Conversion (sRGB -> Linear)
@@ -361,6 +454,7 @@ class DelighterInferenceEngine:
                         },
                     )
                     tile_prediction = outputs[0][0]
+                    log(f"Tile {tile_number}/{total_tiles} done, {tile_number / total_tiles:.0%}")
 
                     accumulator[:, y0:y1, x0:x1] += tile_prediction * tile_weights
                     weight_map[:, y0:y1, x0:x1] += tile_weights
@@ -385,6 +479,7 @@ class DelighterInferenceEngine:
                 lit_tile = np.pad(lit_tile, ((0, 0), (0, pad_h), (0, pad_w)), mode="edge")
                 geo_tile = np.pad(geo_tile, ((0, 0), (0, pad_h), (0, pad_w)), mode="edge")
 
+            log("Running the model on the whole map (no progress until it returns)...")
             outputs = self.model.run(
                 [self.output_name],
                 {
@@ -393,11 +488,23 @@ class DelighterInferenceEngine:
                 },
             )
             pred_albedo_linear = outputs[0][0, :, :h, :w]
+            log("Model finished")
             progress(0.85)
 
         # 4. Convert Linear -> sRGB & Apply UV Mask
+        broken = int((~np.isfinite(pred_albedo_linear)).sum())
+        if broken:
+            raise RuntimeError(f"The model returned {broken} NaN or infinite values on {self.device_info}; try force CPU.")
         log("Converting predicted Albedo to sRGB space...")
         pred_srgb = linear_to_srgb(pred_albedo_linear)
+        if inside.any():  # did it do anything? Compared with the lit map, inside the UVs
+            result, change = pred_srgb[:, inside], float(np.abs(pred_srgb - lit_t)[:, inside].mean())
+            log(f"result inside the mask: min {result.min():.3f} max {result.max():.3f} mean {result.mean():.3f}, "
+                f"mean change from the lit map {change:.4f}")
+            if result.mean() < 0.005:
+                log("WARNING: the result is practically black")
+            if change < 0.002:
+                log("WARNING: the result is practically identical to the lit map: nothing was de-lit")
         if apply_mask:
             pred_srgb = pred_srgb * mask_t
 
@@ -416,6 +523,7 @@ class DelighterInferenceEngine:
         if not cv2.imwrite(str(output_path), output_bgr):
             raise IOError(f"Failed to write output image: {output_path}")
         progress(1.0)
-        log(f"SUCCESS: Saved output to '{output_path}'")
+        log(f"SUCCESS: Saved output to '{output_path}' ({output_path.stat().st_size / 2 ** 20:.1f} MB) "
+            f"in {time.time() - started:.1f} s")
 
         return str(output_path), (w, h), self.device_info

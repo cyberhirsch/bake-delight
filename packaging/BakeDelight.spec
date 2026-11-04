@@ -1,5 +1,6 @@
-# PyInstaller: a folder app, BakeDelight/ with BakeDelight.exe (the interface) and BakeDelightJob.exe
-# (the scan job it starts). It runs from any folder without installing and without admin rights.
+# PyInstaller: a folder app, BakeDelight/ with BakeDelight.exe (the interface), BakeDelightDebug.exe (the
+# same with a console showing the log) and BakeDelightJob.exe (the scan job the interface starts).
+# It runs from any folder without installing and without admin rights.
 #     pyinstaller packaging/BakeDelight.spec --noconfirm      (models/*.onnx must be present)
 from pathlib import Path
 
@@ -25,8 +26,11 @@ app = Analysis([str(ROOT / "packaging" / "app.py")], pathex=paths, datas=datas, 
 job = Analysis([str(ROOT / "packaging" / "job.py")], pathex=paths, hiddenimports=["autoremesher", "quadwild"],
                excludes=excludes)
 
-app_exe = EXE(PYZ(app.pure), app.scripts, [], exclude_binaries=True, name="BakeDelight", console=False,
+app_pyz = PYZ(app.pure)
+app_exe = EXE(app_pyz, app.scripts, [], exclude_binaries=True, name="BakeDelight", console=False,
               uac_admin=False)
+debug_exe = EXE(app_pyz, app.scripts, [], exclude_binaries=True, name="BakeDelightDebug", console=True,
+                uac_admin=False)
 job_exe = EXE(PYZ(job.pure), job.scripts, [], exclude_binaries=True, name="BakeDelightJob", console=True,
               uac_admin=False)
-COLLECT(app_exe, app.binaries, app.datas, job_exe, job.binaries, job.datas, name="BakeDelight")
+COLLECT(app_exe, debug_exe, app.binaries, app.datas, job_exe, job.binaries, job.datas, name="BakeDelight")

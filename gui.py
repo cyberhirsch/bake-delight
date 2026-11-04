@@ -5,7 +5,13 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import webbrowser
+
+import applog
+
+LOG_PATH = applog.start()  # before the heavy imports, so a failing one is logged too
+
 import cv2
 import numpy as np
 import customtkinter as ctk
@@ -723,6 +729,8 @@ class DelighterGUI(TuiWidgets):
                   hint="trained for overcast light; bundled with the app")
         self._row(tab, "DEVICE", lambda parent: self._check(parent, "force CPU", self.var["force_cpu"]))
         self._row(tab, "", lambda parent: self._button(parent, "reload engine", self._load_engine_async))
+        self._row(tab, "", lambda parent: self._button(parent, "open log folder", lambda: os.startfile(applog.LOG_DIR)),
+                  hint="BakeDelightDebug.exe also shows the log in a console")
         self._section(tab, "inference")
         self._row(tab, "VRAM", lambda parent: self._option(parent, self.vram_preset, [*VRAM_PRESETS, "custom"],
                                                            command=self._apply_vram_preset),
@@ -863,6 +871,7 @@ class DelighterGUI(TuiWidgets):
                 engine = DelighterInferenceEngine(model_name)
                 self._post(lambda: self._on_engine_ready(engine, load_id, model_name))
             except Exception as e:
+                traceback.print_exc()
                 error = str(e)
                 self._post(lambda error=error: self._on_engine_error(error, load_id))
 
@@ -886,7 +895,9 @@ class DelighterGUI(TuiWidgets):
     def _set_status(self, text, color):
         self.status_label.configure(text=f"● {text}", text_color=color)
 
-    def _append_log(self, text):
+    def _append_log(self, text, echo=True):
+        if echo:  # the engine prints its own lines
+            print(f"[App] {text}", flush=True)
         box = self.console_textbox
         box.configure(state="normal")
         box.insert("end", f"{time.strftime('%H:%M:%S')} > {text}\n")
@@ -1021,7 +1032,7 @@ class DelighterGUI(TuiWidgets):
         self._set_progress(TABS["delight"], 0.0)
 
         def log_ui(msg):
-            self._post(lambda: self._append_log(msg))
+            self._post(lambda: self._append_log(msg, echo=False))
 
         def progress_ui(fraction):
             self._post(lambda: self._set_progress(TABS["delight"], fraction))
@@ -1034,6 +1045,7 @@ class DelighterGUI(TuiWidgets):
                 result = {"albedo": out_file, "size": list(dims), "device": dev, "seconds": round(time.time() - started, 1)}
                 self._post(lambda: (self._record_result("delight", result), self._on_success(out_file, time.time() - started)))
             except Exception as e:
+                traceback.print_exc()
                 message = str(e)
                 self._post(lambda: self._on_error(message))
 
@@ -1081,6 +1093,7 @@ class DelighterGUI(TuiWidgets):
             return
         scan_ready = os.path.isfile(self.var["scan"].get().strip()) and os.path.isfile(os.path.join(self._scan_out(), "work", "lit.png"))
         if stage == "delight" and not scan_ready:
+            self._append_log("de-light: no baked scan here, using the maps set in 1 IMPORT")
             self._start_processing()  # no baked scan: de-light the maps set in 1 IMPORT
         else:
             self._start_scan(stage)
@@ -1129,27 +1142,36 @@ class DelighterGUI(TuiWidgets):
     def _run_scan_optimizer(self, command, env, source, stage="all", out=""):
         glb_path, tail, started = None, [], time.time()
         current = TABS.get(stage, "")  # the tab label of the stage now running
+        decile = -1
+        print(f"[App] job: {subprocess.list2cmdline(command)}", flush=True)
+        print(f"[App] job DELIGHTER_FORCE_CPU={env.get('DELIGHTER_FORCE_CPU', '')!r}", flush=True)
         try:
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
                                        env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             for line in process.stdout:
-                line = line.rstrip()
+                line = applog.clean(line).rstrip()
                 if line.startswith("@progress "):
                     try:
                         fraction = float(line.split()[1])
                     except (IndexError, ValueError):
                         continue
                     self._post(lambda what=current, fraction=fraction: self._set_progress(what, fraction))
+                    if int(fraction * 10) != decile:  # the console gets every 10 %
+                        decile = int(fraction * 10)
+                        print(f"[Job] {current.strip()}  {fraction:.0%}", flush=True)
                     continue
+                print(f"[Job] {line}", flush=True)
                 tail = (tail + [line])[-12:]
                 if line.startswith("[") and "/5]" in line[:6]:
                     number = int(line[1])
                     current = TABS[STAGES[number - 1]] + (f"  ·  {number}/5" if stage == "all" else "")
-                    self._post(lambda text=line, what=current: (self._append_log(f"  {text}"), self._set_progress(what, 0.0)))
+                    self._post(lambda text=line, what=current: (self._append_log(f"  {text}", echo=False), self._set_progress(what, 0.0)))
                 elif line.startswith("done: "):
                     glb_path = line[6:].split("  (")[0].strip()
             code = process.wait()
+            print(f"[App] job exit code {code} ({code & 0xFFFFFFFF:#x}) after {time.time() - started:.1f} s", flush=True)
         except OSError as error:
+            traceback.print_exc()
             code, tail = -1, [str(error)]
 
         def finish():
@@ -1483,6 +1505,7 @@ class DelighterGUI(TuiWidgets):
 
 
 def main():
+    print(f"[App] log file: {LOG_PATH or 'none'}", flush=True)
     app = DelighterGUI()
     if len(sys.argv) > 1 and sys.argv[1].lower().endswith(PROJECT_SUFFIX):
         app.root.after(200, lambda: app._open_project(sys.argv[1]))  # double-clicked .bad file

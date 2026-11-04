@@ -22,6 +22,7 @@ metallic, normal and occlusion are baked as they are, without de-lighting).
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import os
 import shutil
@@ -74,6 +75,8 @@ def write_png8(path: Path, image: np.ndarray) -> None:
 
 
 def main() -> int:
+    faulthandler.enable()  # a native crash (a GPU driver, say) still says where
+    sys.stdout.reconfigure(line_buffering=True, errors="replace")  # lines reach the interface as they happen
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input", type=Path, help="high-res scan or model: OBJ, PLY, GLB/glTF, STL")
     parser.add_argument("--texture", type=Path, help="photo texture, or base colour for --source pbr (default: taken from the material)")

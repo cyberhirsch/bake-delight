@@ -46,6 +46,7 @@ jobs:
           python -c "import trimesh; trimesh.creation.icosphere(subdivisions=4).export('sphere.obj')"
           dist/BakeDelight/BakeDelightJob.exe sphere.obj --out smoke --remesher autoremesher --faces 300 --stage remesh
           if (-not (Test-Path smoke/work/low.obj)) { throw "the remesh stage wrote no mesh" }
+          if (-not (Test-Path dist/BakeDelight/BakeDelightDebug.exe)) { throw "the debug app is missing" }
       - name: Zip
         run: Compress-Archive -Path dist/BakeDelight -DestinationPath BakeDelight-windows.zip
       - uses: actions/upload-artifact@v4
