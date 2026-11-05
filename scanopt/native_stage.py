@@ -304,6 +304,7 @@ def pack_density(uv_points, triangles, resolution: int, margin: int, start: floa
         return (uvs * np.array([atlas.width, atlas.height], np.float32) / resolution)[indices]
 
     fits, fails, best = None, None, None
+    ceiling = start / np.sqrt(0.45)  # `start` covers 45 % of the texture; this would cover all of it
     density = start
     while fits is None and density >= floor:  # shrink until it fits
         if (packed := attempt(density)) is not None:
@@ -312,8 +313,10 @@ def pack_density(uv_points, triangles, resolution: int, margin: int, start: floa
             fails, density = density, density * 0.7
     if fits is None:
         return None, None
-    while fails is None:  # grow until it overflows
-        if (packed := attempt(fits * 1.4)) is not None:
+    while fails is None:  # grow until it overflows, or fills the texture: xatlas scales a chart too big
+        if fits * 1.4 >= ceiling:  # for the atlas down instead of overflowing, so few large charts never would
+            fails = ceiling
+        elif (packed := attempt(fits * 1.4)) is not None:
             fits, best = fits * 1.4, packed
         else:
             fails = fits * 1.4
