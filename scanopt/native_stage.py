@@ -10,7 +10,7 @@ Built from permissively licensed parts:
 The high mesh is a photo scan (one photo texture, to be de-lit) or a PBR model (glTF or OBJ + MTL,
 any number of materials): then base colour, roughness, metallic, normal and occlusion maps are
 sampled at each hit, normal maps decoded in the model's tangent frame and re-encoded in the low
-mesh's.
+mesh's. Any of these textures can be a UDIM set (see tile_files); it is baked into the low mesh's one atlas.
 
 The bake writes into the work folder:
     lit.exr, normal_ts.exr, normal_os.exr, ao.exr, uv_tris.npy, prep.json
@@ -24,6 +24,7 @@ are Y-up on disk (OBJ, glTF) are rotated the way Blender's importers rotate them
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -150,8 +151,8 @@ def read_obj(path: Path, details: bool = False):
     return positions, faces, corner_uv, corner_normals, np.repeat(line_material, per_line), names, libraries
 
 
-def load_scan(path: Path, texture: Path | None):
-    """The scan as welded triangles plus per-corner UVs, and its photo (linear RGB float32)."""
+def load_scan(path: Path, texture: Path | None, log=print):
+    """The scan as welded triangles plus per-corner UVs, and its photo (linear RGB float32, or a TileSet)."""
     import trimesh
     if path.suffix.lower() == ".fbx":
         raise SystemExit("FBX is not supported; export the scan as OBJ, PLY or glTF")
@@ -167,6 +168,10 @@ def load_scan(path: Path, texture: Path | None):
         raise SystemExit("The file contains no meshes")
     if corner_uv is None:
         raise SystemExit("The scan has no UVs, so its photo texture cannot be transferred")
+    named = texture or (_obj_base_color_file(path) if path.suffix.lower() == ".obj" else None)
+    tiles = open_tiles(named, corner_uv, srgb=True, channels=3, log=log) if named else None
+    if tiles is not None:
+        return positions, faces, corner_uv, tiles
     if texture:
         photo = cv2.imread(str(texture), cv2.IMREAD_UNCHANGED)
         if photo is None:
@@ -470,16 +475,23 @@ def normalise(v: np.ndarray) -> np.ndarray:
     return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-20)
 
 
-def sample_photo(photo: np.ndarray, uv: np.ndarray) -> np.ndarray:
-    height, width = photo.shape[:2]
+def _remap(image: np.ndarray, uv: np.ndarray, border: int) -> np.ndarray:
+    """The image at UVs in 0..1, as N x C."""
+    height, width = image.shape[:2]
     columns = 4096
     rows = -(-len(uv) // columns)
     padded = np.zeros((rows * columns, 2), np.float32)
     padded[:len(uv)] = uv
-    map_x = ((padded[:, 0] % 1.0) * width - 0.5).reshape(rows, columns)
-    map_y = ((1.0 - padded[:, 1] % 1.0) * height - 0.5).reshape(rows, columns)
-    values = cv2.remap(photo, map_x.astype(np.float32), map_y.astype(np.float32), cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
-    return values.reshape(-1, photo.shape[2])[:len(uv)]
+    map_x = (padded[:, 0] * width - 0.5).reshape(rows, columns)
+    map_y = ((1.0 - padded[:, 1]) * height - 0.5).reshape(rows, columns)
+    values = cv2.remap(image, map_x.astype(np.float32), map_y.astype(np.float32), cv2.INTER_LINEAR, borderMode=border)
+    return values.reshape(-1, image.shape[2])[:len(uv)]
+
+
+def sample_photo(photo, uv: np.ndarray) -> np.ndarray:
+    if isinstance(photo, TileSet):
+        return photo.sample(uv)
+    return _remap(photo, uv % 1.0, cv2.BORDER_WRAP)
 
 
 # ---------------------------------------------------------------- PBR sources
@@ -501,13 +513,112 @@ def _float_image(image, srgb: bool) -> np.ndarray:
     return srgb_to_linear(array) if srgb else array
 
 
-def read_map(path: Path, srgb: bool) -> np.ndarray:
+def _read_image(path: Path) -> np.ndarray:
+    """A texture file as stored: H x W (grey) or H x W x 3 (RGB), its alpha dropped."""
     image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if image is None:
         raise SystemExit(f"Cannot read the texture {path}")
-    if image.ndim == 3:
-        image = cv2.cvtColor(image[..., :3], cv2.COLOR_BGR2RGB)
-    return _float_image(image, srgb)
+    return cv2.cvtColor(image[..., :3], cv2.COLOR_BGR2RGB) if image.ndim == 3 else image
+
+
+def read_map(path: Path, srgb: bool) -> np.ndarray:
+    return _float_image(_read_image(path), srgb)
+
+
+# ---------------------------------------------------------------- UDIM tiles
+
+_TILE_NAME = re.compile(r"(?<![0-9a-z])(<udim>|<uvtile>|1\d{3}|u\d+_v\d+)(?![0-9a-z])", re.I)
+
+
+def tile_files(path: Path) -> dict[tuple[int, int], Path]:
+    """The files of the UDIM set `path` names or belongs to, per tile (column, row). Accepts
+    name.<UDIM>.png, name.<UVTILE>.png, name.1001.png and name_u1_v1.png (1001 is u1_v1, 1012 is u2_v2)."""
+    path = Path(path)
+    found = list(_TILE_NAME.finditer(path.name))
+    if not found or not path.parent.is_dir():
+        return {}
+    start, end = found[-1].span(1)
+    token = found[-1].group(1).lower()
+    numbered = "udim" in token or token.isdigit()
+    pattern = re.compile(re.escape(path.name[:start]) + (r"(1\d{3})" if numbered else r"u(\d+)_v(\d+)") + re.escape(path.name[end:]), re.I)
+    files = {}
+    for candidate in path.parent.iterdir():
+        match = pattern.fullmatch(candidate.name)
+        if match and candidate.is_file():
+            if numbered:
+                column, row = (int(match[1]) - 1001) % 10, (int(match[1]) - 1001) // 10
+            else:
+                column, row = int(match[1]) - 1, int(match[2]) - 1
+            if column >= 0 and row >= 0:
+                files[column, row] = candidate
+    return files
+
+
+class TileSet:
+    """A texture spread over UDIM tiles. The tiles stay as stored (8-bit is a quarter of float32: sets
+    get large) and are converted after sampling, so 8-bit colour is interpolated in sRGB."""
+
+    def __init__(self, images: dict[tuple[int, int], np.ndarray], srgb: bool, channels: int | None = None):
+        self.images, self.srgb = images, srgb
+        self.channels = channels or max(image.shape[2] for image in images.values())
+
+    def select(self, channel: int) -> "TileSet":
+        return TileSet({tile: image[..., channel:channel + 1] for tile, image in self.images.items()}, self.srgb, 1)
+
+    def first(self) -> np.ndarray:
+        return _float_image(next(iter(self.images.values())), self.srgb)
+
+    def sample(self, uv: np.ndarray) -> np.ndarray:
+        def codes(cells):
+            return cells[:, 0] + cells[:, 1] * 1024
+
+        cell = np.floor(uv).astype(np.int64)
+        known = np.array(list(self.images), np.int64)
+        lost = ~np.isin(codes(cell), codes(known))
+        if lost.any():  # on the upper edge of a tile, or in a tile the set lacks: that one reads the first tile
+            cell[lost] = np.floor(uv[lost] - 1e-6).astype(np.int64)
+            lost = ~np.isin(codes(cell), codes(known))
+            cell[lost] = known[0]
+        out = np.zeros((len(uv), self.channels), np.float32)
+        code = codes(cell)
+        for tile, image in self.images.items():
+            hits = np.nonzero(code == tile[0] + tile[1] * 1024)[0]
+            if not len(hits):
+                continue
+            local = uv[hits] - np.array(tile, np.float32)
+            local = np.where((local < 0) | (local > 1), local % 1.0, local)
+            values = _float_image(_remap(image, local, cv2.BORDER_REPLICATE)[:, None], self.srgb)[:, 0]
+            out[hits] = np.repeat(values[:, :1], self.channels, axis=1) if values.shape[1] < self.channels else values[:, :self.channels]
+        return out
+
+
+def open_tiles(path: Path, corner_uv: np.ndarray | None, srgb: bool, channels: int | None = None, log=print) -> TileSet | None:
+    """The UDIM set `path` stands for, or None when it is an ordinary texture. A number in a file name
+    only counts as a tile if the UVs do use several UDIM tiles: photo_1001.png next to photo_1002.png
+    can be two versions of one texture."""
+    path = Path(path)
+    explicit = "<" in path.name
+    files = tile_files(path)
+    if explicit and not files:
+        raise SystemExit(f"No texture tiles found for {path}")
+    if corner_uv is None or not files:
+        return None
+    used = {tuple(cell) for cell in np.unique(np.floor(corner_uv.mean(axis=1)).astype(np.int64), axis=0).tolist()}
+    if not explicit and (len(files) < 2 or len(used) < 2 or any(not (0 <= u < 10 and v >= 0) for u, v in used)):
+        return None
+    wanted = sorted(used & files.keys())
+    if not wanted:
+        raise SystemExit(f"The model's UVs use none of the tiles of {path}")
+    if used - files.keys():
+        tiles = ", ".join(str(1001 + u + 10 * v) for u, v in sorted(used - files.keys()))
+        log(f"  WARNING: the UVs use tiles without a file for {path.name}: {tiles}; those faces read tile {1001 + wanted[0][0] + 10 * wanted[0][1]}")
+    images = {}
+    for tile in wanted:
+        image = _read_image(files[tile])
+        images[tile] = image[..., None] if image.ndim == 2 else image
+    widths = [image.shape[1] for image in images.values()]
+    log(f"  UDIM set {path.name}: {len(images)} tiles in use, {min(widths)}-{max(widths)} px, {sum(image.nbytes for image in images.values()) / 2 ** 30:.1f} GB")
+    return TileSet(images, srgb, channels)
 
 
 class Material:
@@ -520,7 +631,9 @@ class Material:
 
     def set_map(self, key: str, image: np.ndarray, channel: int | None = None):
         """A map that is the value itself (MTL maps, overrides): its factor becomes 1."""
-        self.images[key] = image if channel is None else image[..., channel:channel + 1]
+        if channel is not None:
+            image = image.select(channel) if isinstance(image, TileSet) else image[..., channel:channel + 1]
+        self.images[key] = image
         if key in self.factors:
             self.factors[key] = np.ones(3, np.float32) if key == "base_color" else 1.0
 
@@ -540,6 +653,7 @@ class Material:
 
 def _looks_like_normal_map(image: np.ndarray) -> bool:
     """OBJ's map_Bump holds either a height map or a tangent-space normal map: tell them apart."""
+    image = image.first() if isinstance(image, TileSet) else image
     if image.shape[2] < 3:
         return False
     mean = image[::8, ::8, :3].reshape(-1, 3).mean(axis=0)
@@ -557,12 +671,12 @@ def _mtl_file(value: str, folder: Path) -> Path | None:
     if not name:
         return None
     for candidate in (folder / name, folder / Path(name).name, folder / "textures" / Path(name).name):
-        if candidate.is_file():
+        if ("<" in candidate.name and tile_files(candidate)) or ("<" not in candidate.name and candidate.is_file()):
             return candidate
     return None
 
 
-def read_mtl(libraries: list[str], folder: Path, names: list[str], log=print) -> list[Material]:
+def _mtl_statements(libraries: list[str], folder: Path, log=print) -> dict[str, dict[str, str]]:
     statements: dict[str, dict[str, str]] = {}
     current = None
     for library in libraries:
@@ -576,6 +690,30 @@ def read_mtl(libraries: list[str], folder: Path, names: list[str], log=print) ->
                 current = statements.setdefault(value.strip(), {})
             elif current is not None and key:
                 current[key.lower()] = value.strip()
+    return statements
+
+
+def _obj_base_color_file(path: Path) -> Path | None:
+    """The first map_Kd in an OBJ's material library, which may name a UDIM set."""
+    with path.open("rb") as handle:
+        for line in handle:
+            if line[:2] == b"f ":
+                return None
+            if line[:7] == b"mtllib ":
+                statements = _mtl_statements([line[7:].strip().decode("utf-8", "replace")], path.parent, log=lambda text: None)
+                for values in statements.values():
+                    if "map_kd" in values:
+                        return _mtl_file(values["map_kd"], path.parent)
+                return None
+    return None
+
+
+def read_mtl(libraries: list[str], folder: Path, names: list[str], corner_uv: np.ndarray | None = None, log=print) -> list[Material]:
+    def read(path: Path, srgb: bool):
+        tiles = open_tiles(path, corner_uv, srgb, log=log)
+        return tiles if tiles is not None else read_map(path, srgb)
+
+    statements = _mtl_statements(libraries, folder, log)
     materials = []
     for name in names:
         material, values = Material(name), statements.get(name, {})
@@ -588,11 +726,11 @@ def read_mtl(libraries: list[str], folder: Path, names: list[str], log=print) ->
                                      ("metallic", "map_pm", False), ("occlusion", "map_ka", False)):
             path = _mtl_file(values[statement], folder) if statement in values else None
             if path:  # Kd next to map_Kd is usually a preview colour: the map wins
-                material.set_map(key, read_map(path, srgb), channel=None if key == "base_color" else 0)
+                material.set_map(key, read(path, srgb), channel=None if key == "base_color" else 0)
         for statement in ("norm", "map_bump", "bump"):
             path = _mtl_file(values[statement], folder) if statement in values else None
             if path:
-                image = read_map(path, srgb=False)
+                image = read(path, srgb=False)
                 if _looks_like_normal_map(image):
                     material.images["normal"] = image
                 else:
@@ -686,7 +824,7 @@ def load_pbr(path: Path, overrides: dict[str, Path | None], log=print) -> PbrSou
         raise SystemExit("FBX models need converting to glTF or OBJ for the PBR bake")
     if suffix == ".obj":
         positions, faces, corner_uv, corner_normals, face_material, names, libraries = read_obj(path, details=True)
-        materials = read_mtl(libraries, path.parent, names, log)
+        materials = read_mtl(libraries, path.parent, names, corner_uv, log)
     else:
         loaded = trimesh.load(str(path), process=False)
         meshes = loaded.dump(concatenate=False) if isinstance(loaded, trimesh.Scene) else [loaded]
@@ -717,7 +855,8 @@ def load_pbr(path: Path, overrides: dict[str, Path | None], log=print) -> PbrSou
         corner_uv = np.zeros((len(faces), 3, 2))
     for key, file in overrides.items():
         if file:
-            image = read_map(Path(file), srgb=key == "base_color")
+            image = open_tiles(Path(file), corner_uv, srgb=key == "base_color", log=log)
+            image = image if image is not None else read_map(Path(file), srgb=key == "base_color")
             for material in materials:
                 if key == "normal":
                     material.images["normal"] = image
@@ -914,7 +1053,7 @@ def bake_layout(scan: Path, texture: Path | None, out: Path, cage: float, max_ra
         return _bake_and_write(scan, out, model.positions, model.faces, model.corner_uv, None, positions, sizes, loop_verts,
                                loop_uv, tri_loops, unwrap_info, resolution, margin, cage, max_ray, ao_samples, topology,
                                log, pbr=model)
-    raw_pos, raw_faces, corner_uv, photo = load_scan(scan, texture)
+    raw_pos, raw_faces, corner_uv, photo = load_scan(scan, texture, log)
     high_pos, high_faces, _ = weld(raw_pos, raw_faces)
     progress(0.15)
     return _bake_and_write(scan, out, high_pos, high_faces, corner_uv, photo, positions, sizes, loop_verts, loop_uv,

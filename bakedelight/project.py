@@ -76,7 +76,7 @@ DESCRIPTIONS = {
     ("delight", "bit_depth"): "output PNG bit depth",
     ("delight", "apply_mask"): "black out texels outside the UV islands",
     ("scan", "scan"): "high-res scan or model: OBJ, PLY, GLB/glTF, STL",
-    ("scan", "photo"): "photo texture (base colour for pbr); empty = taken from the material",
+    ("scan", "photo"): "photo texture (base colour for pbr), may be a UDIM set; empty = taken from the material",
     ("scan", "out"): "output folder; empty = <scan>_optimized next to the scan",
     ("scan", "source"): "scan: photo scan, de-lit; pbr: model with PBR materials, baked as they are",
     ("scan", "remesher"): "decimate (triangles), autoremesher or quadwild (quads)",

@@ -90,7 +90,7 @@ def scan_command(project: Project, machine: dict | None = None) -> tuple[list[st
     s = project.settings["scan"]
     if not s["scan"] or not os.path.isfile(s["scan"]):
         raise ProjectError(f"scan.scan: no such file {s['scan']!r}" if s["scan"] else "scan.scan is not set")
-    if s["photo"] and not os.path.isfile(s["photo"]):
+    if s["photo"] and "<" not in s["photo"] and not os.path.isfile(s["photo"]):  # "<": a UDIM set, name.<UDIM>.png
         raise ProjectError(f"scan.photo: no such file {s['photo']!r}")
     scan = Path(s["scan"])
     out = Path(s["out"]) if s["out"] else scan.with_name(scan.stem + "_optimized")

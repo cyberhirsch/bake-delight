@@ -17,6 +17,9 @@ Sources (--source): scan (photo texture with the light in it, de-lit) or pbr (a
 high-res model with PBR materials, glTF or OBJ + MTL: base colour, roughness,
 metallic, normal and occlusion are baked as they are, without de-lighting).
 --map-* replace the model's own maps.
+
+Textures spread over UDIM tiles (name.<UDIM>.png, name.1001.png, name_u1_v1.png) are
+read as one set and baked into the single atlas.
 """
 
 from __future__ import annotations
@@ -79,7 +82,7 @@ def main() -> int:
     sys.stdout.reconfigure(line_buffering=True, errors="replace")  # lines reach the interface as they happen
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input", type=Path, help="high-res scan or model: OBJ, PLY, GLB/glTF, STL")
-    parser.add_argument("--texture", type=Path, help="photo texture, or base colour for --source pbr (default: taken from the material)")
+    parser.add_argument("--texture", type=Path, help="photo texture, or base colour for --source pbr; may be a UDIM set (default: taken from the material)")
     parser.add_argument("--source", choices=["scan", "pbr"], default="scan",
                         help="scan: photo scan, de-lit; pbr: model with PBR materials, baked as they are")
     for key, text in (("roughness", "roughness"), ("metallic", "metallic"), ("normal", "tangent-space normal (OpenGL, +Y)"),
