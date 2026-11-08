@@ -1,6 +1,7 @@
 # Builds the Windows folder app (BakeDelight-windows.zip). Run it from the Actions tab, or push a
 # v* tag to also attach the zip to that release. The de-lighter model is not in git: it is read
-# from the release tagged model-overcast.
+# from the release tagged model-overcast, AutoRemesher from the one tagged build-tools (a copy of its
+# 1.2.0 Windows zip: GitHub's download of the original kept timing out).
 name: Build Windows app
 
 on:
@@ -33,9 +34,11 @@ jobs:
       - name: Build
         run: pyinstaller packaging/BakeDelight.spec --noconfirm
       - name: Add AutoRemesher 1.2.0 (MIT) and the licence notices
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $zip = "autoremesher.zip"
-          Invoke-WebRequest https://github.com/huxingyi/autoremesher/releases/download/1.2.0/autoremesher-1.2.0-win32-x86_64.zip -OutFile $zip
+          gh release download build-tools --pattern autoremesher-1.2.0-win32-x86_64.zip
+          $zip = "autoremesher-1.2.0-win32-x86_64.zip"
           if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne "F6184622CEF84F0BCF032A0474DF44E2076F4C10C159F1AF0CB7230259AF7476") {
             throw "the AutoRemesher download does not match the 1.2.0 release"
           }
@@ -44,8 +47,6 @@ jobs:
           New-Item -ItemType Directory dist/BakeDelight/licenses | Out-Null
           Copy-Item packaging/licenses/* dist/BakeDelight/licenses
           Copy-Item LICENSE dist/BakeDelight/licenses/LICENSE-ai-texture-delighter.txt
-          Invoke-WebRequest https://www.gnu.org/licenses/lgpl-3.0.txt -OutFile dist/BakeDelight/licenses/lgpl-3.0.txt
-          Invoke-WebRequest https://www.gnu.org/licenses/gpl-3.0.txt -OutFile dist/BakeDelight/licenses/gpl-3.0.txt
       - name: Smoke test the scan job with the bundled AutoRemesher
         run: |
           python -c "import trimesh; trimesh.creation.icosphere(subdivisions=4).export('sphere.obj')"
