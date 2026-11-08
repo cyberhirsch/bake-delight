@@ -1,79 +1,98 @@
-> ## Notice: Beta recalled<br/>
-> The pre-trained model weights for this project have been removed due to potential legal complications.<br/>
-> This repository was built primarily for experimentation and for getting feedback.<br/>
-> A commercial-grade version featuring pipeline improvements can be expected in the future.<br/>
+# Bake & Delight
 
-# AI-Powered Texture De-Lighter
+Photogrammetry scan or high-res PBR model in, game-ready asset out. Windows app.
 
-AI-powered texture de-lighting for **photogrammetry and scanned assets**.
+Bake & Delight reduces a dense mesh, unwraps it, bakes the high-res detail onto the new mesh and, for scans, removes the lighting that was photographed into the texture. The result is a low-poly model with albedo, normal, ambient occlusion, roughness and metallic maps, as GLB and as OBJ with PNG textures.
 
-This tool removes environmental lighting from 3D scanned assets, producing a cleaner approximation of the object's true surface color (albedo).
+## Download
 
-![Viewport Preview](https://github.com/vdmrcll/ai-texture-delightier/blob/main/preview.jpg)
-*Figure 1: De-lighted and original assets comparison*
+1. Download `BakeDelight-windows.zip` from the [latest release](https://github.com/cyberhirsch/bake-delight/releases/latest).
+2. Unzip it anywhere you can write to, such as your Documents folder rather than Program Files.
+3. Start `BakeDelight.exe`.
 
-## Requirements
+No installation, no admin rights and no Python are needed; the de-lighting model is in the zip. It runs on any DirectX 12 graphics card and falls back to the CPU without one.
 
-### Operating System
+The app checks for a newer release at start and asks before updating itself. You can turn this off under SYS → updates.
 
-* Windows 10/11 (64-bit)
-* Python 3.8 or newer
-* Python must be installed and available in the system `PATH`
+## How it works
 
-### GPU
+The tabs follow the pipeline. F5 runs the current tab's stage, F6 runs them all.
 
-An NVIDIA CUDA-capable GPU is **highly recommended**.
+| Tab | What it does |
+|---|---|
+| 1 IMPORT | The high-res mesh (OBJ, PLY, GLB/glTF, STL) and its texture. Source **scan**: a photo texture to be de-lit. Source **pbr**: a model with PBR materials, baked as they are. |
+| 2 REMESH | Reduce to a face count: decimate (triangles), AutoRemesher (quads, bundled) or QuadWild (quads, see below). |
+| 3 UV | Unwrap and pack into one texture of 512 to 4096 px. |
+| 4 BAKE | Ray-trace colour, normals and ambient occlusion from the high-res mesh onto the low one. PBR models also give roughness and metallic. |
+| 5 DELIGHT | The AI model turns the baked photo colour into albedo. It can also de-light maps you made elsewhere. |
+| 6 EXPORT | GLB, OBJ + MTL and the texture PNGs. |
 
-* **Minimum:** 6 GB VRAM (e.g. GTX 1060)
-* GPU execution targets **CUDA 11.8**
-* Bundled GPU setup targets **cuDNN 8.9.5**
-* CPU execution is supported as a fallback, but will be significantly slower
+The viewport compares before and after: 1 / 2 / 3 switch between single, side-by-side and wipe views, and M steps through the maps. The SYS tab lists every key.
 
-The launcher automatically installs the required CUDA/cuDNN/cuFFT runtime DLLs into the virtual environment.
+Source textures can be a UDIM set (`name.<UDIM>.png`, `name.1001.png`, `name_u1_v1.png`); it is baked into the single texture of the new mesh.
 
-## Input Maps
+### De-lighting your own maps
 
-The network expects **four input maps**:
+The model needs four maps of the same square size:
 
-| Map                     | Description                                                 |
-| ----------------------- | ----------------------------------------------------------- |
-| **Lit RGB Texture**     | Original texture containing baked-in environmental lighting |
-| **Object-Space Normal** | Object-space normal map in **DirectX** format               |
-| **Ambient Occlusion**   | Ambient occlusion map                                       |
-| **Alpha Mask**          | Alpha/transparency mask                                     |
+- **lit:** the colour texture with the lighting in it (sRGB)
+- **normal:** object-space normals, Z up (Blender's axes), as the bake writes them
+- **AO:** ambient occlusion
+- **mask:** white where the texture is used
 
-### Important
+It was trained on [Poly Haven](https://polyhaven.com) scans relit under overcast skies. It removes soft shading and ambient occlusion well, and hard sun shadows less well.
 
-* All input maps should have matching dimensions and have 1:1 A/R.
-* Use **sRGB** color space for the texture inputs.
-* Use **small padding** around the texture/UV islands.
-* The normal map must be **Object Space / DirectX**.
+### Graphics memory
 
-## Installation & Running
+DELIGHT → VRAM presets (CPU only, 4 GB, 6–8 GB, 12 GB +) set the tile size so large maps fit your card. Tiling is on by default.
 
-1. Install **Python 3.8+** and make sure it is available in your system `PATH`.
-2. Download the app from the releases.
-3. Run the installer/start script depending on your OS.
+## Projects, command line and agents
 
-Windows:
+Settings and results are saved in `.bad` project files (1 IMPORT → project → save, or Ctrl+S).
 
-```text
-run.bat
+`bake-delight` runs the same pipeline without the interface:
+
+```bat
+bake-delight new stone.bad --scan stone.obj --photo stone.jpg --set scan.faces=6000
+bake-delight scan stone.bad
+bake-delight delight --lit lit.png --out albedo.png
+bake-delight keys
 ```
 
-Linux:
+`bake-delight mcp` starts an MCP server on stdio, so Claude and other agents can create projects, change settings, run scans and de-light, and follow the jobs.
 
-```text
-bash run.sh
+These two run from source (see below), not from the packaged app.
+
+## When something goes wrong
+
+- `BakeDelightDebug.exe` is the same app with a console showing everything it does.
+- Every run writes `%APPDATA%\TextureDelighter\logs\bakedelight.log`, and keeps the previous one as `.log.1`. The DELIGHT tab has an "open log folder" button. Please attach the log to an issue.
+
+## QuadWild
+
+QuadWild + Bi-MDF (GPL-3.0) is not bundled. Download it from [cgg-bern/quadwild-bimdf](https://github.com/cgg-bern/quadwild-bimdf/releases) and set its folder under SYS → QUADWILD DIR. It runs as a separate program.
+
+## Running from source
+
+Python 3.13 on Windows:
+
+```bat
+python -m venv .venv
+.venv\Scripts\pip install -r packaging/requirements.txt
+gh release download model-overcast --repo cyberhirsch/bake-delight --pattern overcast.onnx --dir models
+.venv\Scripts\python gui.py
 ```
 
-The launcher will:
+For the command line and MCP server, also run `pip install mcp`.
 
-1. Create/configure a Python virtual environment.
-2. Install the required dependencies.
-3. Configure the ONNX Runtime environment.
-4. Launch the application.
+`pyinstaller packaging/BakeDelight.spec --noconfirm` builds the folder app. GitHub Actions builds it for every `v*` tag and attaches the zip to that release.
 
-If CUDA is unavailable, the application will fall back to CPU execution.
+`training/` holds the pipeline that made the model: fetching Poly Haven assets, baking lit variations in Blender, and training.
 
-Thanks for testing and helping improve the project!
+`run.bat`, `run.sh` and `download_weights.py` are left over from the original project and no longer work.
+
+## Credits and licence
+
+Bake & Delight grew out of [AI Texture De-Lighter](https://github.com/vdmrcll/ai-texture-delightier) by Vida Marcell. MIT licence, see [LICENSE](LICENSE).
+
+The app bundles AutoRemesher (MIT) with its Qt libraries (LGPL-3.0), ONNX Runtime, OpenCV, trimesh, Embree, xatlas and others. [packaging/licenses/THIRD_PARTY_NOTICES.txt](packaging/licenses/THIRD_PARTY_NOTICES.txt) lists each one and its licence.
