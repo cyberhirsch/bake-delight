@@ -25,6 +25,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release download model-overcast --pattern overcast.onnx --dir models
+      - name: Set the version from the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          (Get-Content bakedelight/__init__.py) -replace '^__version__ = .*', "__version__ = `"$version`"" | Set-Content bakedelight/__init__.py
       - name: Build
         run: pyinstaller packaging/BakeDelight.spec --noconfirm
       - name: Add AutoRemesher 1.2.0 (MIT) and the licence notices

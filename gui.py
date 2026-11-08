@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 import webbrowser
+from pathlib import Path
 
 import applog
 
@@ -20,7 +21,7 @@ from tkinter import filedialog, messagebox
 from tkinterdnd2 import TkinterDnD, DND_FILES
 from PIL import Image
 
-from bakedelight import models
+from bakedelight import __version__, models, updater
 from bakedelight.project import SUFFIX as PROJECT_SUFFIX, Project, ProjectError
 from engine import DelighterInferenceEngine
 from tui import (ACCENT, ACCENT_DIM, BG, BORDER, BORDER_HI, DIM, ERROR, FIELD, HINT, PANEL, TEXT, TEXT_HI,  # noqa: F401
@@ -36,6 +37,7 @@ except Exception:
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SCANOPT_SCRIPT = os.path.join(APP_DIR, "scanopt", "scanopt.py")
 SETTINGS_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "TextureDelighter", "settings.json")
+UPDATE_LOG = Path(applog.LOG_DIR) / "update.log"
 # Mirrors scanopt.REMESHERS; kept here so the GUI starts even if scanopt's dependencies are missing.
 REMESHERS = {
     "Triangles - decimation (QEM)": "decimate",
@@ -92,7 +94,7 @@ DEFAULTS = {
     "autorotate": False, "autorotate_speed": 20.0,
     # system
     "quadwild_dir": r"F:\DelighterData\tools\quadwild-bimdf", "autoremesher_dir": "",
-    "scanopt_python": "", "ui_scale": 1.0, "log_lines": "2000",
+    "scanopt_python": "", "ui_scale": 1.0, "log_lines": "2000", "check_updates": True,
 }
 
 # GUI setting -> project setting. These go into .bad files; the rest is per machine (settings.json).
@@ -152,7 +154,7 @@ class DelighterGUI(TuiWidgets):
         self.engine = None
         self.last_output_path = None
         self._engine_load_id = 0
-        self._busy = {"delight": False, "scan": False}
+        self._busy = {"delight": False, "scan": False, "update": False}
         self.viewport = None           # main view: single, wipe, or the "after" side
         self.viewport_before = None    # left view in side-by-side mode, same camera
         self.viewport_error = None
@@ -185,6 +187,7 @@ class DelighterGUI(TuiWidgets):
         self._load_engine_async()
         self._refresh_viewport()
         self._load_high()
+        self.root.after(1500, self._start_update_check)
 
     # ================================================================ threads
 
@@ -247,6 +250,93 @@ class DelighterGUI(TuiWidgets):
         if not self._confirm_discard():
             return
         self._save_settings()
+        self.root.destroy()
+
+    # ================================================================ updates
+
+    def _start_update_check(self):
+        failure = updater.last_failure(UPDATE_LOG)
+        if failure:
+            self._append_log(f"!! update: {failure}")
+            messagebox.showwarning("Update", failure, parent=self.root)
+        target = updater.install_dir()
+        if target:
+            updater.cleanup(target)
+        if self._value("check_updates"):
+            self._check_for_update(quiet=True)
+
+    def _check_for_update(self, quiet=False):
+        def work():
+            try:
+                release = updater.check()
+            except Exception as error:  # offline, rate limited: never in the way of the work
+                message = f"update check failed: {error}"
+                self._post(lambda: self._append_log(message))
+                return
+            self._post(lambda: self._offer_update(release, quiet))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _offer_update(self, release, quiet):
+        if release is None:
+            self._append_log(f"version {__version__} is up to date")
+            if not quiet:
+                messagebox.showinfo("Update", f"Version {__version__} is up to date.", parent=self.root)
+            return
+        self._append_log(f"version {release.version} is available (this is {__version__})")
+        if any(self._busy.values()):
+            return  # not in the middle of a run: the log has it, the next start asks
+        target = updater.install_dir()
+        if not updater.can_install(target):
+            why = "Running from source: update with git." if target is None else f"This app cannot write to {target}."
+            if messagebox.askyesno("Update", f"Version {release.version} is available; this is {__version__}.\n{why}\n\n"
+                                             "Open the download page?", parent=self.root):
+                webbrowser.open(release.page)
+            return
+        if messagebox.askyesno("Update", f"Version {release.version} is available; this is {__version__}.\n\n"
+                                         f"Download {release.size / 2 ** 20:.0f} MB now? The app restarts when it is ready.", parent=self.root):
+            self._download_update(release, target)
+
+    def _download_update(self, release, target):
+        self._busy["update"] = True
+        self._refresh_run_buttons()
+        what = f"update {release.version}"
+        shown = [-1]
+
+        def progress(fraction):
+            if round(fraction * 100) != shown[0]:
+                shown[0] = round(fraction * 100)
+                self._post(lambda: self._set_progress(what, fraction))
+
+        def work():
+            try:
+                new = updater.download(release, target, progress)
+                self._post(lambda: self._install_update(release, target, new))
+            except Exception as error:
+                traceback.print_exc()
+                message = str(error)
+                self._post(lambda: self._update_failed(target, message))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_failed(self, target, message):
+        self._busy["update"] = False
+        self._set_progress()
+        self._refresh_run_buttons()
+        updater.cleanup(target)
+        self._append_log(f"!! update failed: {message}")
+        messagebox.showerror("Update", f"The update failed: {message}", parent=self.root)
+
+    def _install_update(self, release, target, new):
+        if self._busy["delight"]:  # started while the update downloaded
+            self.root.after(1000, lambda: self._install_update(release, target, new))
+            return
+        if not self._confirm_discard():
+            self._update_failed(target, "cancelled")
+            return
+        self._append_log(f"installing version {release.version}: the app restarts")
+        self._save_settings()
+        updater.launch_swap(target, new, UPDATE_LOG)
         self.root.destroy()
 
     # ================================================================ projects (.bad)
@@ -791,6 +881,10 @@ class DelighterGUI(TuiWidgets):
         self._row(tab, "", lambda parent: self._button(parent, "apply scale", lambda: self._apply_ui_scale(self._value("ui_scale", float))))
         self._row(tab, "LOG LINES", lambda parent: self._entry(parent, self.var["log_lines"], width=90))
         self._row(tab, "", lambda parent: self._button(parent, "clear log", self._clear_log))
+        self._section(tab, "updates")
+        self._row(tab, "VERSION", lambda parent: self._label(parent, __version__, color=TEXT, size=12))
+        self._row(tab, "", lambda parent: self._check(parent, "check at start", self.var["check_updates"]))
+        self._row(tab, "", lambda parent: self._button(parent, "check for updates", self._check_for_update))
         self._section(tab, "settings")
         self._row(tab, "", lambda parent: self._button(parent, "open settings folder",
                                                        lambda: os.startfile(os.path.dirname(SETTINGS_PATH))
@@ -1505,7 +1599,7 @@ class DelighterGUI(TuiWidgets):
 
 
 def main():
-    print(f"[App] log file: {LOG_PATH or 'none'}", flush=True)
+    print(f"[App] Bake & Delight {__version__}, log file: {LOG_PATH or 'none'}", flush=True)
     app = DelighterGUI()
     if len(sys.argv) > 1 and sys.argv[1].lower().endswith(PROJECT_SUFFIX):
         app.root.after(200, lambda: app._open_project(sys.argv[1]))  # double-clicked .bad file
